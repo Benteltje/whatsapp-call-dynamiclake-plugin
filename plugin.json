@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "identifier": "com.dynamiclake.plugins.whatsapp-call",
+  "name": "WhatsApp Call",
+  "version": "1.0.0",
+  "developerName": "Benteltje",
+  "description": "Shows an active WhatsApp call in the notch: call icon and elapsed time with a live waveform — your voice in green, the other participant in orange — plus microphone, End call and camera controls. Detects calls in the WhatsApp desktop app and in web.whatsapp.com browser tabs.",
+  "executable": "whatsapp-call-monitor",
+  "icon": "WhatsAppCallIcon.png",
+  "arguments": [],
+  "autoStart": true,
+  "supportsSneakPeek": true,
+  "settings": [
+    {
+      "id": "pollSeconds",
+      "title": "Refresh",
+      "description": "How often the plugin checks for an active WhatsApp call.",
+      "type": "slider",
+      "default": 1,
+      "min": 0.5,
+      "max": 5,
+      "step": 0.25,
+      "systemImage": "arrow.clockwise",
+      "tint": "cyan"
+    },
+    {
+      "id": "detectNativeCalls",
+      "title": "WhatsApp Desktop App",
+      "description": "Detect calls opened in the WhatsApp macOS app.",
+      "type": "switch",
+      "default": true,
+      "systemImage": "app.badge.checkmark",
+      "tint": "green"
+    },
+    {
+      "id": "detectWebCalls",
+      "title": "WhatsApp Web In Tabs",
+      "description": "Detect calls in web.whatsapp.com browser tabs via Apple Events.",
+      "type": "switch",
+      "default": true,
+      "systemImage": "safari",
+      "tint": "blue"
+    },
+    {
+      "id": "webUrlFallback",
+      "title": "Fallback Without JavaScript",
+      "description": "Show the activity from the in-call URL when JavaScript from Apple Events is unavailable, with unknown mic and camera state.",
+      "type": "switch",
+      "default": true,
+      "systemImage": "link",
+      "tint": "orange"
+    },
+    {
+      "id": "diagnosticActivity",
+      "title": "Diagnostic Activity",
+      "description": "Show a fake call so you can preview the interface without joining one.",
+      "type": "switch",
+      "default": false,
+      "systemImage": "stethoscope",
+      "tint": "red"
+    },
+    {
+      "id": "showWaveform",
+      "title": "Live Waveform",
+      "description": "Your voice in green, the other participant in orange, animated while a call runs.",
+      "type": "switch",
+      "default": true,
+      "systemImage": "waveform",
+      "tint": "green"
+    }
+  ]
+}
