@@ -16,5 +16,43 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: WhatsAppCall-package
-          path: dist/*
+          path: |
+            dist/*
+            WhatsAppCall.dynamiclakeplugin/
+            WhatsAppCall.dynamiclakeplugin.zip
+            WhatsAppCall.dynamiclakeplugin.zip.sha256
           if-no-files-found: error
+  refresh-root-download:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: WhatsAppCall-package
+          path: ${{ runner.temp }}/plugin-download
+      - name: Refresh root download after successful tests
+        env:
+          BUILT_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          if [ "$(git rev-parse origin/main)" != "$BUILT_COMMIT" ]; then
+            echo "A newer source commit exists; its build will refresh the download."
+            exit 0
+          fi
+          rm -rf WhatsAppCall.dynamiclakeplugin
+          ditto "$RUNNER_TEMP/plugin-download/WhatsAppCall.dynamiclakeplugin" WhatsAppCall.dynamiclakeplugin
+          chmod 755 WhatsAppCall.dynamiclakeplugin/whatsapp-call-monitor
+          cp "$RUNNER_TEMP/plugin-download/WhatsAppCall.dynamiclakeplugin.zip" .
+          cp "$RUNNER_TEMP/plugin-download/WhatsAppCall.dynamiclakeplugin.zip.sha256" .
+          shasum -a 256 -c WhatsAppCall.dynamiclakeplugin.zip.sha256
+          git add WhatsAppCall.dynamiclakeplugin WhatsAppCall.dynamiclakeplugin.zip WhatsAppCall.dynamiclakeplugin.zip.sha256
+          if git diff --cached --quiet; then exit 0; fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'Refresh ready-to-install plugin download'
+          git push origin HEAD:main

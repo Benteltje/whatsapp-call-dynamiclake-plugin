@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.4
+
+- Every build refreshes the complete `WhatsAppCall.dynamiclakeplugin` package, stable ZIP and checksum in the repository root.
+- Commit ready-to-install root artifacts for direct downloads without a local build.
+- Successful main-branch CI refreshes the root artifacts automatically, with a source-head check before pushing.
+- Release assets include the stable ZIP name as well as the versioned archive.
+- Add tests that verify root/build package equality and stable/versioned ZIP and checksum consistency.
+
 ## 1.1.3
 
 - Default to a small activity with native green phone.fill on the left and plain elapsed text on the right.

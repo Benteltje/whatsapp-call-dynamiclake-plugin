@@ -11,7 +11,8 @@ version=$(/usr/bin/plutil -extract version raw -- "$repo_dir/plugin.json")
 /bin/rm -rf "$package_dir"
 /bin/mkdir -p "$package_dir/Assets"
 module_cache=$(/usr/bin/mktemp -d)
-trap '/bin/rm -rf "$module_cache"' EXIT
+root_staging=$(/usr/bin/mktemp -d "$build_dir/.root-export.XXXXXX")
+trap '/bin/rm -rf "$module_cache" "$root_staging"' EXIT
 sdk_path=$(/usr/bin/xcrun --sdk macosx --show-sdk-path)
 for architecture in arm64 x86_64; do
     /usr/bin/xcrun swiftc -parse-as-library -O \
@@ -29,6 +30,15 @@ done
 archive="$dist_dir/WhatsAppCall-$version.dynamiclakeplugin.zip"
 /usr/bin/ditto -c -k --keepParent "$package_dir" "$archive"
 (cd "$dist_dir" && /usr/bin/shasum -a 256 "${archive:t}" > "${archive:t}.sha256")
+# Publish complete root artifacts only after the package/archive build succeeds.
+/usr/bin/ditto "$package_dir" "$root_staging/WhatsAppCall.dynamiclakeplugin"
+/bin/cp "$archive" "$root_staging/WhatsAppCall.dynamiclakeplugin.zip"
+(cd "$root_staging" && /usr/bin/shasum -a 256 WhatsAppCall.dynamiclakeplugin.zip > WhatsAppCall.dynamiclakeplugin.zip.sha256)
+/bin/rm -rf "$repo_dir/WhatsAppCall.dynamiclakeplugin"
+/bin/mv "$root_staging/WhatsAppCall.dynamiclakeplugin" "$repo_dir/"
+/bin/mv "$root_staging/WhatsAppCall.dynamiclakeplugin.zip" "$repo_dir/"
+/bin/mv "$root_staging/WhatsAppCall.dynamiclakeplugin.zip.sha256" "$repo_dir/"
+echo "Root download $repo_dir/WhatsAppCall.dynamiclakeplugin.zip"
 echo "Built $package_dir"
 echo "Archive $archive"
 /usr/bin/lipo -archs "$package_dir/whatsapp-call-monitor"

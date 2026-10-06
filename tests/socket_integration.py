@@ -21,6 +21,19 @@ assert (package / manifest['icon']).is_file()
 architectures = subprocess.check_output(['lipo', '-archs', str(binary)], text=True).split()
 assert set(architectures) == {'arm64', 'x86_64'}
 archive = root / 'dist' / f"WhatsAppCall-{manifest['version']}.dynamiclakeplugin.zip"
+# Root downloads must be byte-for-byte copies of this build, with correct checksum names.
+import hashlib
+root_package = root / 'WhatsAppCall.dynamiclakeplugin'
+package_files = {p.relative_to(package) for p in package.rglob('*') if p.is_file()}
+root_files = {p.relative_to(root_package) for p in root_package.rglob('*') if p.is_file()}
+assert root_files == package_files
+for relative in package_files:
+    assert (root_package / relative).read_bytes() == (package / relative).read_bytes()
+root_archive = root / 'WhatsAppCall.dynamiclakeplugin.zip'
+assert root_archive.read_bytes() == archive.read_bytes()
+checksum = (root / 'WhatsAppCall.dynamiclakeplugin.zip.sha256').read_text().split()
+assert checksum == [hashlib.sha256(root_archive.read_bytes()).hexdigest(), root_archive.name]
+assert (root_package / binary.name).stat().st_mode & 0o111
 with zipfile.ZipFile(archive) as z:
     assert f'{package.name}/plugin.json' in z.namelist()
     assert not any('/Sources/' in n for n in z.namelist())

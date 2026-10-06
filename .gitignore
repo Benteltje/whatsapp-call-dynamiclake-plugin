@@ -1,5 +1,6 @@
 build/
 dist/
-whatsapp-call-monitor
+/whatsapp-call-monitor
 *.zip
 .DS_Store
+!/WhatsAppCall.dynamiclakeplugin.zip

@@ -20,4 +20,4 @@ jobs:
       - name: Publish package and checksum
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.sha256 --verify-tag --title "WhatsApp Call $GITHUB_REF_NAME" --notes-file CHANGELOG.md
+        run: gh release create "$GITHUB_REF_NAME" dist/*.zip dist/*.sha256 WhatsAppCall.dynamiclakeplugin.zip WhatsAppCall.dynamiclakeplugin.zip.sha256 --verify-tag --title "WhatsApp Call $GITHUB_REF_NAME" --notes-file CHANGELOG.md
