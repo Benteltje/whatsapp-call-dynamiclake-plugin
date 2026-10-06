@@ -14,7 +14,6 @@ private let pluginName = "WhatsApp Call"
 private let activityID = "whatsapp-call.active-call"
 private let socketEnvironmentKey = "DYNAMICLAKE_JSON_SOCKET"
 private let settingsPathEnvironmentKey = "DYNAMICLAKE_PLUGIN_SETTINGS_PATH"
-private let pluginPackageEnvironmentKey = "DYNAMICLAKE_PLUGIN_PACKAGE"
 private let testSessionEnvironmentKey = "DYNAMICLAKE_WHATSAPP_CALL_TEST_SESSION"
 private let maxFrameSize = 64 * 1024
 private let fieldSeparator = "<<<DYNAMICLAKE_FIELD>>>"
@@ -24,10 +23,17 @@ private let actionLoopInterval: TimeInterval = 0.05
 /// Cadence of the waveform animation: fast enough to read as movement, slow
 /// enough that the inline PNG frames stay cheap on the local socket.
 private let waveformInterval: TimeInterval = 0.12
-/// Bars per side — the far end on the left in green, your microphone on the right in orange.
+/// Bars per side — your microphone on the left in green, the far end on the right in orange.
 private let waveformBarsPerSide = 7
 private let waveformWidth = 100
 private let waveformHeight = 28
+/// No mic buffer for this long means the engine was interrupted (another app
+/// took the input) rather than the room going quiet.
+private let micStaleSeconds: TimeInterval = 0.5
+
+/// The widest compact geometry: a 351 x 33 pt panel with 77 pt side slots, which
+/// is what the phone icon, the elapsed time and the waveform need together.
+private let activitySize = "normal"
 
 /// Silence required before a dismissal of a known call is forgotten, so the
 /// next call in the same app shows again. One quiet poll is already a closed
@@ -64,11 +70,9 @@ private struct PluginSettings: Equatable, CustomStringConvertible {
     var diagnosticActivity = false
     var showWaveform = true
     var captureAppAudio = false
-    var compactPresentation = "Phone + time"
-    var displaysWaveform: Bool { showWaveform && compactPresentation == "Phone + waveform" }
 
     var description: String {
-        "PluginSettings(pollSeconds: \(pollSeconds), detectNativeCalls: \(detectNativeCalls), detectWebCalls: \(detectWebCalls), webUrlFallback: \(webUrlFallback), diagnosticActivity: \(diagnosticActivity), showWaveform: \(showWaveform), captureAppAudio: \(captureAppAudio), compactPresentation: \(compactPresentation))"
+        "PluginSettings(pollSeconds: \(pollSeconds), detectNativeCalls: \(detectNativeCalls), detectWebCalls: \(detectWebCalls), webUrlFallback: \(webUrlFallback), diagnosticActivity: \(diagnosticActivity), showWaveform: \(showWaveform), captureAppAudio: \(captureAppAudio))"
     }
 }
 
@@ -140,8 +144,7 @@ private func loadSettings(previous: PluginSettings? = nil) -> PluginSettings {
         webUrlFallback: boolValue(settingValue(values, id: "webUrlFallback", default: true), default: true),
         diagnosticActivity: boolValue(settingValue(values, id: "diagnosticActivity", default: false), default: false),
         showWaveform: boolValue(settingValue(values, id: "showWaveform", default: true), default: true),
-        captureAppAudio: boolValue(settingValue(values, id: "captureAppAudio", default: false), default: false),
-        compactPresentation: settingValue(values, id: "compactPresentation", default: "Phone + time") as? String ?? "Phone + time"
+        captureAppAudio: boolValue(settingValue(values, id: "captureAppAudio", default: false), default: false)
     )
 }
 
@@ -760,12 +763,15 @@ private final class WaveformMeter {
     /// The process the open tap listens to, and when each source last tried.
     private var tapPID: pid_t = 0
     private var micLastAttempt = Date.distantPast
+    private var micLastBufferAt = Date.distantPast
+    private var micLastRestartAt = Date.distantPast
     private var tapLastAttempt = Date.distantPast
 
     struct Snapshot {
         let mic: Float
         let other: Float
         let micRunning: Bool
+        let micStale: Bool
         let micFrames: Int
         let otherRunning: Bool
     }
@@ -775,6 +781,7 @@ private final class WaveformMeter {
         let mic = micLevel
         let micOn = micRunning
         let micCount = micFrames
+        let micAt = micLastBufferAt
         lock.unlock()
 
         tapReadingLock.lock()
@@ -796,7 +803,16 @@ private final class WaveformMeter {
         let other = otherLevel
         lock.unlock()
 
-        return Snapshot(mic: micOn ? mic : 0, other: other, micRunning: micOn, micFrames: micCount, otherRunning: frames > 0)
+        let fresh = micOn && Date().timeIntervalSince(micAt) < micStaleSeconds
+        return Snapshot(mic: fresh ? mic : 0, other: other, micRunning: micOn, micStale: micOn && !fresh, micFrames: micCount, otherRunning: frames > 0)
+    }
+
+    /// True when the engine claims to run but no buffer has arrived recently.
+    private var micInputStalled: Bool {
+        lock.lock()
+        let stalled = engine != nil && Date().timeIntervalSince(micLastBufferAt) >= micStaleSeconds
+        lock.unlock()
+        return stalled
     }
 
     /// Opens whatever is missing. The microphone belongs to this process rather
@@ -814,7 +830,20 @@ private final class WaveformMeter {
             if !micOpen && micRetryDue {
                 startMicrophone()
                 lock.lock()
-                if engine == nil { micLastAttempt = Date().addingTimeInterval(55) }
+                if engine == nil { micLastAttempt = Date().addingTimeInterval(2) }
+                lock.unlock()
+            } else if micOpen, micInputStalled, Date().timeIntervalSince(micLastRestartAt) >= 3 {
+                // The engine object is alive but no buffers arrive: another app
+                // took the input, or the device changed underneath us. Restart
+                // it instead of freezing on the last value forever.
+                debugLog("waveform: input stalled; restarting microphone")
+                lock.lock()
+                micLastRestartAt = Date()
+                lock.unlock()
+                stopMicrophone()
+                startMicrophone()
+                lock.lock()
+                if engine == nil { micLastAttempt = Date().addingTimeInterval(2) }
                 lock.unlock()
             }
         } else if micOpen {
@@ -895,6 +924,7 @@ private final class WaveformMeter {
                 let rms = sqrtf(sum / Float(frames))
                 self.lock.lock()
                 self.micLevel = rms
+                self.micLastBufferAt = Date()
                 self.micFrames += 1
                 self.lock.unlock()
             }
@@ -909,7 +939,7 @@ private final class WaveformMeter {
         lock.lock()
         micRunning = true
         lock.unlock()
-        debugLog("waveform: microphone meter running")
+        debugLog("waveform: microphone meter running device=\(inputDeviceName())")
     }
 
     private func startProcessTap(pid: pid_t) {
@@ -1028,8 +1058,6 @@ private final class WaveformMeter {
     }
 }
 
-/// Linear ramp from −50 dBFS to −10 dBFS. Below the floor the room is silent
-/// and the bar sits at its minimum; speech lands in the middle of the range.
 private func microphoneCaptureAllowed(_ status: AVAuthorizationStatus) -> Bool {
     status == .authorized
 }
@@ -1053,10 +1081,44 @@ private func runAudioCheck() -> Int32 {
     return result.micFrames > 0 ? 0 : 1
 }
 
-private func normalizedLevel(_ level: Float) -> Float {
-    guard level > 0 else { return 0 }
-    let decibels = 20 * log10(level)
-    return min(max((decibels + 50) / 40, 0), 1)
+/// Name of the default input device, for the debug log: if a call switches the
+/// mic to another device, the waveform values change with it.
+private func inputDeviceName() -> String {
+    var address = AudioObjectPropertyAddress(
+        mSelector: kAudioHardwarePropertyDefaultInputDevice,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    var deviceID = AudioDeviceID(kAudioObjectUnknown)
+    var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+    guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &deviceID) == noErr,
+          deviceID != kAudioObjectUnknown else { return "?" }
+    var name: CFString = "" as CFString
+    var nameSize = UInt32(MemoryLayout<CFString>.stride)
+    var nameAddress = AudioObjectPropertyAddress(
+        mSelector: kAudioDevicePropertyDeviceNameCFString,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMain)
+    guard AudioObjectGetPropertyData(deviceID, &nameAddress, 0, nil, &nameSize, &name) == noErr else { return "?" }
+    return name as String
+}
+
+/// Bar height for one raw RMS reading, relative to the loudest recent moment.
+/// Normal talking sits around half the bar, peaks reach the top, and only true
+/// silence sits at the bottom — whatever the microphone's gain happens to be.
+private func scaledLevel(_ level: Float, peak: Float) -> Float {
+    let silenceFloor: Float = 0.001 // −60 dBFS: true silence only; quiet voices must pass
+    guard level > 0, peak >= silenceFloor else { return 0 }
+    return min(max(level / peak, 0), 1)
+}
+
+/// Attack on a new loud moment, but one tick may raise the reference by at
+/// most ~12 dB so a single device click cannot pin it above a real voice; then
+/// release slowly (about 6 dB per 15 s) so pauses do not reset it.
+private func updatedPeak(_ peak: Float, _ level: Float) -> Float {
+    let silenceFloor: Float = 0.001
+    if peak < silenceFloor { return level }
+    if level > peak { return min(level, peak * 4) }
+    return peak * 0.9945
 }
 
 private func renderWaveformPNG(you: [Float], them: [Float], youMuted: Bool) -> Data? {
@@ -1096,22 +1158,17 @@ private func renderWaveformPNG(you: [Float], them: [Float], youMuted: Bool) -> D
         context.fillPath()
     }
 
-    // Far end first (green), local microphone at the end (orange).
-    for (index, value) in them.enumerated() {
-        draw(index, value, green)
-    }
+    // Your microphone leads in green, the far end follows in orange — green is
+    // you talking, orange is the other participant.
     for (index, value) in you.enumerated() {
-        draw(them.count + index, youMuted ? 0 : value, youMuted ? gray : orange)
+        draw(index, youMuted ? 0 : value, youMuted ? gray : green)
+    }
+    for (index, value) in them.enumerated() {
+        draw(you.count + index, value, orange)
     }
 
     guard let image = context.makeImage() else { return nil }
-    let data = NSMutableData()
-    guard let destination = CGImageDestinationCreateWithData(data as CFMutableData, "public.png" as CFString, 1, nil) else {
-        return nil
-    }
-    CGImageDestinationAddImage(destination, image, nil)
-    guard CGImageDestinationFinalize(destination) else { return nil }
-    return data as Data
+    return pngData(from: image)
 }
 
 /// Which process carries the call audio: WhatsApp itself for a native call,
@@ -1671,33 +1728,20 @@ private func iconButton(id: String, systemImage: String, actionID: String, tint:
     ]
 }
 
-private let bundledIconPNG: Data? = {
-    let package = ProcessInfo.processInfo.environment[pluginPackageEnvironmentKey]
-        .map { URL(fileURLWithPath: $0) }
-        ?? URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.deletingLastPathComponent()
-    guard let data = try? Data(contentsOf: package.appendingPathComponent("Assets/WhatsAppLightIcon.png")),
-          data.count <= 48 * 1024 else { return nil }
-    return data
-}()
+/// ImageIO writes a PNG out of whatever the compact slots are given.
+private func pngData(from image: CGImage?) -> Data? {
+    guard let image else { return nil }
+    let data = NSMutableData()
+    guard let destination = CGImageDestinationCreateWithData(data as CFMutableData, "public.png" as CFString, 1, nil) else {
+        return nil
+    }
+    CGImageDestinationAddImage(destination, image, nil)
+    guard CGImageDestinationFinalize(destination) else { return nil }
+    return data as Data
+}
 
 private func phoneComponent(id: String) -> [String: Any] {
     ["type": "image", "id": id, "source": "sfSymbol", "systemImage": "phone.fill", "tint": "green"]
-}
-
-private func pluginIconComponent(id: String) -> [String: Any] {
-    guard let data = bundledIconPNG else { return phoneComponent(id: id) }
-    return ["type": "image", "id": id, "source": "inlineData", "mimeType": "image/png", "base64Data": data.base64EncodedString()]
-}
-
-private func timerComponent(id: String, startedAt: TimeInterval) -> [String: Any] {
-    [
-        "type": "timer",
-        "id": id,
-        "startDate": iso8601Formatter.string(from: Date(timeIntervalSince1970: startedAt)),
-        "endDate": iso8601Formatter.string(from: Date(timeIntervalSince1970: startedAt + timerMaximumDuration)),
-        "countsDown": false,
-        "tint": "white"
-    ]
 }
 
 private func formatElapsed(_ seconds: TimeInterval) -> String {
@@ -1709,17 +1753,10 @@ private func formatElapsed(_ seconds: TimeInterval) -> String {
     return String(format: "%d:%02d", minutes, secs)
 }
 
-/// Native text avoids scaling or clipping a combined icon/time bitmap.
-private func elapsedComponent(id: String, session: CallSession) -> [String: Any] {
-    ["type": "text", "id": id,
-     "text": formatElapsed(Date().timeIntervalSince1970 - session.startedAt),
-     "style": "plain", "tint": "green"]
-}
-
-/// Compact right slot: the live green/orange waveform. Falls back to the app
-/// icon when there is no PNG to show (waveform switched off, render failure).
-private func waveformComponent(id: String, png: Data?) -> [String: Any] {
-    guard let png else { return pluginIconComponent(id: id) }
+/// Compact right slot: the live green/orange waveform. Without a PNG (waveform
+/// switched off, nothing rendered yet) the slot is simply left empty.
+private func waveformComponent(id: String, png: Data?) -> [String: Any]? {
+    guard let png else { return nil }
     return [
         "type": "image",
         "id": id,
@@ -1743,14 +1780,16 @@ private func endCallButtonComponent(id: String) -> [String: Any] {
     ]
 }
 
-/// Compact phone SF Symbol on the left, actual audio levels on the right.
+/// Compact surface: the tilted green phone symbol on the left, the live
+/// waveform on the right.
 private func compactSurface(session: CallSession, waveform: Data?, showWaveform: Bool) -> [String: Any] {
-    [
-        "leftSlot": phoneComponent(id: "whatsapp-phone"),
-        "rightSlot": showWaveform
-            ? waveformComponent(id: "whatsapp-waveform", png: waveform)
-            : elapsedComponent(id: "whatsapp-time", session: session)
+    var surface: [String: Any] = [
+        "leftSlot": phoneComponent(id: "whatsapp-phone")
     ]
+    if showWaveform, let wave = waveformComponent(id: "whatsapp-waveform", png: waveform) {
+        surface["rightSlot"] = wave
+    }
+    return surface
 }
 
 /// Sent on every waveform tick. Only the compact surface is named, so the sneak
@@ -1760,7 +1799,7 @@ private func compactUpdatePayload(session: CallSession, waveform: Data?, showWav
         "schemaVersion": schemaVersion,
         "type": "update",
         "activityID": activityID,
-        "size": "small",
+        "size": activitySize,
         "surfaces": [
             "compactLiveActivity": compactSurface(session: session, waveform: waveform, showWaveform: showWaveform)
         ]
@@ -1807,12 +1846,9 @@ private func activityPayload(
         "activityID": activityID,
         "title": "WhatsApp",
         "priority": "high",
-        "size": "small",
+        "size": activitySize,
         "surfaces": [
             "compactLiveActivity": compactSurface(session: session, waveform: waveform, showWaveform: showWaveform),
-            "extraLiveActivity": [
-                "leftSlot": pluginIconComponent(id: "whatsapp-extra-icon")
-            ],
             "sneakPeek": [
                 "leftSlot": iconButton(id: "whatsapp-mic", systemImage: micSymbol, actionID: "toggle-mic", tint: micTint),
                 "center": endCallButtonComponent(id: "whatsapp-end-call"),
@@ -1864,6 +1900,10 @@ private final class WhatsAppCallPlugin {
     private var lastWavePNG: Data?
     private var lastWaveElapsed = ""
     private var waveTickCount = 0
+    private var micPeak: Float = 0
+    private var otherPeak: Float = 0
+    private var micRecent: [Float] = []
+    private var waveDiagCount = 0
 
     init(client: JSONSocketClient) {
         self.client = client
@@ -1912,7 +1952,7 @@ private final class WhatsAppCallPlugin {
                 // The waveform is the one thing that must keep moving between
                 // polls: without it a call looks frozen for a full second at a time.
                 if published, let session = currentSession, Date() >= nextWaveAt {
-                    nextWaveAt = Date().addingTimeInterval(settings.displaysWaveform ? waveformInterval : 1.0)
+                    nextWaveAt = Date().addingTimeInterval(settings.showWaveform ? waveformInterval : 1.0)
                     try waveformTick(session: session, settings: settings)
                 }
             }
@@ -2169,7 +2209,7 @@ private final class WhatsAppCallPlugin {
                 // A real call is on screen again, leftovers no longer apply.
                 statelessArmedUntil = nil
             }
-            if settings.displaysWaveform, let pid = waveformTargetPID(for: nextSession) {
+            if settings.showWaveform, let pid = waveformTargetPID(for: nextSession) {
                 meter.ensureRunning(targetPID: pid, micWanted: nextSession.micMuted == false, tapWanted: settings.captureAppAudio)
             } else {
                 meter.stop()
@@ -2205,18 +2245,17 @@ private final class WhatsAppCallPlugin {
             session.cameraOn.map(String.init) ?? "unknown",
             String(settings.showWaveform),
             String(settings.captureAppAudio),
-            settings.compactPresentation
         ].joined(separator: "|")
 
         guard signature != lastSignature else { return }
 
         let commandType = published ? "update" : "create"
-        let waveform = waveformPNG(muted: !["test", "diagnostic"].contains(session.kind) && session.micMuted != false, enabled: settings.displaysWaveform, includeOther: settings.captureAppAudio || ["test", "diagnostic"].contains(session.kind))
+        let waveform = waveformPNG(muted: !["test", "diagnostic"].contains(session.kind) && session.micMuted != false, enabled: settings.showWaveform, includeOther: settings.captureAppAudio || ["test", "diagnostic"].contains(session.kind))
         try client.send(activityPayload(
             commandType: commandType,
             session: session,
             waveform: waveform,
-            showWaveform: settings.displaysWaveform
+            showWaveform: settings.showWaveform
         ))
         debugLog("sent \(commandType) key=\(session.key) mic=\(session.micMuted.map(String.init) ?? "?") camera=\(session.cameraOn.map(String.init) ?? "?")")
         published = true
@@ -2290,7 +2329,7 @@ private final class WhatsAppCallPlugin {
     /// surface only when the bars or the duration actually changed — a silent
     /// call then costs one frame per second instead of eight.
     private func waveformTick(session: CallSession, settings: PluginSettings) throws {
-        if !settings.displaysWaveform {
+        if !settings.showWaveform {
             let elapsed = formatElapsed(Date().timeIntervalSince1970 - session.startedAt)
             guard elapsed != lastWaveElapsed else { return }
             try client.send(compactUpdatePayload(session: session, waveform: nil, showWaveform: false))
@@ -2302,12 +2341,34 @@ private final class WhatsAppCallPlugin {
         padHistories()
         let preview = ["test", "diagnostic"].contains(session.kind)
         let phase = Float(ProcessInfo.processInfo.systemUptime * 5)
-        youHistory.append(preview ? (sin(phase) + 1) * 0.4 + 0.1 : normalizedLevel(snapshot.mic))
-        themHistory.append(preview ? (sin(phase + 2) + 1) * 0.35 : normalizedLevel(snapshot.other))
+        if preview {
+            youHistory.append((sin(phase) + 1) * 0.4 + 0.1)
+            themHistory.append((sin(phase + 2) + 1) * 0.35)
+        } else {
+            // Median of the last three readings: speech sustains across
+            // buffers, single-buffer device clicks do not.
+            micRecent.append(snapshot.mic)
+            if micRecent.count > 3 { micRecent.removeFirst() }
+            let micSmoothed = micRecent.sorted(by: <)[micRecent.count / 2]
+            micPeak = updatedPeak(micPeak, micSmoothed)
+            otherPeak = updatedPeak(otherPeak, snapshot.other)
+            let you = scaledLevel(micSmoothed, peak: micPeak)
+            youHistory.append(you)
+            themHistory.append(scaledLevel(snapshot.other, peak: otherPeak))
+
+            waveDiagCount += 1
+            if waveDiagCount % 8 == 1 {
+                debugLog(String(
+                    format: "waveform: mic=%.5f (%.1f dB) peak=%.5f (%.1f dB) bar=%.2f frames=%d tap=%.5f stale=%d",
+                    micSmoothed, 20 * log10(max(Double(micSmoothed), 1e-6)),
+                    micPeak, 20 * log10(max(Double(micPeak), 1e-6)),
+                    you, snapshot.micFrames, snapshot.other, snapshot.micStale ? 1 : 0))
+            }
+        }
         youHistory.removeFirst(max(0, youHistory.count - waveformBarsPerSide))
         themHistory.removeFirst(max(0, themHistory.count - waveformBarsPerSide))
 
-        let waveform = waveformPNG(muted: !["test", "diagnostic"].contains(session.kind) && session.micMuted != false, enabled: settings.displaysWaveform, includeOther: settings.captureAppAudio || ["test", "diagnostic"].contains(session.kind))
+        let waveform = waveformPNG(muted: !["test", "diagnostic"].contains(session.kind) && session.micMuted != false, enabled: settings.showWaveform, includeOther: settings.captureAppAudio || ["test", "diagnostic"].contains(session.kind))
         let elapsed = formatElapsed(Date().timeIntervalSince1970 - session.startedAt)
         guard waveform != lastWavePNG || elapsed != lastWaveElapsed else { return }
 
@@ -2316,7 +2377,7 @@ private final class WhatsAppCallPlugin {
         try client.send(compactUpdatePayload(
             session: session,
             waveform: waveform,
-            showWaveform: settings.displaysWaveform
+            showWaveform: settings.showWaveform
         ))
 
         waveTickCount += 1
@@ -2404,7 +2465,10 @@ private func runSelfTest() -> Int32 {
     check(!microphoneCaptureAllowed(.notDetermined) && !microphoneCaptureAllowed(.denied) && !microphoneCaptureAllowed(.restricted), "no permission prompts")
     check(microphoneCaptureAllowed(.authorized), "reuse granted microphone permission")
     check(!PluginSettings().captureAppAudio, "system audio capture opt-in")
-    check(normalizedLevel(0) == 0 && normalizedLevel(0.1) > 0.7, "audio amplitude drives waveform")
+    check(scaledLevel(0, peak: 0.1) == 0 && scaledLevel(0.1, peak: 0.1) == 1, "audio amplitude drives waveform")
+    let midBar = scaledLevel(0.05, peak: 0.1)
+    check(midBar > 0.45 && midBar < 0.55, "six dB below the loudest moment is mid-bar")
+    check(updatedPeak(0.01, 0.2) == 0.2 && updatedPeak(0.2, 0.01) < 0.2, "peak attack and slow release")
     check(doubleValue("nan", default: 1, minimum: 0.5, maximum: 5) == 1, "non-finite setting")
     check(doubleValue(99, default: 1, minimum: 0.5, maximum: 5) == 5, "setting clamp")
     check(isWebCallURL("https://web.whatsapp.com/call/123"), "call URL")
@@ -2419,15 +2483,24 @@ private func runSelfTest() -> Int32 {
     check(parseWebState("garbage") == nil, "malformed web state")
     if let png = renderWaveformPNG(you: Array(repeating: 1, count: 7), them: Array(repeating: 1, count: 7), youMuted: false),
        let bitmap = NSBitmapImageRep(data: png),
-       let farEnd = bitmap.colorAt(x: 4, y: 28)?.usingColorSpace(.deviceRGB),
-       let local = bitmap.colorAt(x: 196, y: 28)?.usingColorSpace(.deviceRGB) {
-        check(farEnd.greenComponent > farEnd.redComponent, "far end green on left")
-        check(local.redComponent > local.greenComponent, "local mic orange on right")
+       let yours = bitmap.colorAt(x: 4, y: 28)?.usingColorSpace(.deviceRGB),
+       let theirs = bitmap.colorAt(x: 196, y: 28)?.usingColorSpace(.deviceRGB) {
+        check(yours.greenComponent > yours.redComponent, "your microphone green on the left")
+        check(theirs.redComponent > theirs.greenComponent, "far end orange on the right")
     } else { check(false, "waveform rendered color samples") }
-    let compact = compactSurface(session: testSession(), waveform: nil, showWaveform: false)
-    check((compact["leftSlot"] as? [String: Any])?["systemImage"] as? String == "phone.fill", "phone on left")
-    check((compact["rightSlot"] as? [String: Any])?["type"] as? String == "text", "native elapsed text on right")
-    check(!PluginSettings().displaysWaveform, "compact time is default")
+
+    // The compact surface: the tilted phone symbol owns the left slot, the
+    // waveform owns the right one.
+    let quiet = compactSurface(session: testSession(), waveform: nil, showWaveform: false)
+    let left = quiet["leftSlot"] as? [String: Any]
+    check(left?["type"] as? String == "image" && left?["source"] as? String == "sfSymbol" && left?["systemImage"] as? String == "phone.fill", "tilted phone symbol in the left slot")
+    check(quiet["rightSlot"] == nil, "no waveform when the waveform is switched off")
+
+    let live = compactSurface(session: testSession(), waveform: renderWaveformPNG(you: Array(repeating: 0.5, count: 7), them: Array(repeating: 0.5, count: 7), youMuted: false), showWaveform: true)
+    let wave = live["rightSlot"] as? [String: Any]
+    check(wave?["type"] as? String == "image" && wave?["id"] as? String == "whatsapp-waveform", "waveform on the right")
+    check(activitySize == "normal", "middle compact geometry")
+    check(PluginSettings().showWaveform, "waveform is on by default")
     check(formatElapsed(125) == "2:05", "elapsed time")
     check(waveformTargetPID(for: testSession()) == nil, "test never captures real audio")
     check(waveformTargetPID(for: diagnosticSession()) == nil, "preview never captures real audio")
@@ -2584,7 +2657,7 @@ private func runDemoJSON() -> Int32 {
         commandType: "create",
         session: sample,
         waveform: renderWaveformPNG(you: demoYou, them: demoThem, youMuted: false),
-        showWaveform: loadSettings().displaysWaveform
+        showWaveform: loadSettings().showWaveform
     ))
     return 0
 }

@@ -2,34 +2,15 @@
   "schemaVersion": 1,
   "identifier": "com.dynamiclake.plugins.whatsapp-call",
   "name": "WhatsApp Call",
-  "version": "1.1.4",
+  "version": "1.2.5",
   "developerName": "Benteltje",
-  "description": "Compact WhatsApp call activity: green phone on the left and elapsed time on the right, with microphone, End call and camera controls. Optional waveform layout.",
+  "description": "Compact WhatsApp call activity: tilted green phone symbol on the left, live green/orange waveform on the right, and microphone, End call and camera controls.",
   "executable": "whatsapp-call-monitor",
   "icon": "WhatsAppCallIcon.png",
   "arguments": [],
   "autoStart": true,
   "supportsSneakPeek": true,
   "settings": [
-    {
-      "id": "compactPresentation",
-      "title": "Compact Appearance",
-      "description": "Phone and time is the small default. Choose the waveform layout to display audio levels instead of elapsed time.",
-      "type": "select",
-      "default": "Phone + time",
-      "options": [
-        {
-          "title": "Phone + time",
-          "systemImage": "clock"
-        },
-        {
-          "title": "Phone + waveform",
-          "systemImage": "waveform"
-        }
-      ],
-      "systemImage": "phone.fill",
-      "tint": "green"
-    },
     {
       "id": "pollSeconds",
       "title": "Refresh",
@@ -81,7 +62,7 @@
     {
       "id": "showWaveform",
       "title": "Live Waveform",
-      "description": "Live levels from your already-authorized microphone. No new microphone permission prompt.",
+      "description": "Live levels on the right of the compact activity, from your already-authorized microphone. No new microphone permission prompt.",
       "type": "switch",
       "default": true,
       "systemImage": "waveform",
