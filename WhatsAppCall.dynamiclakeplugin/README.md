@@ -2,7 +2,7 @@
 
 [Download the latest release ZIP](https://github.com/Benteltje/whatsapp-call-dynamiclake-plugin/releases/latest/download/WhatsAppCall.dynamiclakeplugin.zip) · [Download the current main-branch build](https://github.com/Benteltje/whatsapp-call-dynamiclake-plugin/raw/refs/heads/main/WhatsAppCall.dynamiclakeplugin.zip)
 
-Shows a detected WhatsApp call in the macOS notch: a green `phone.fill` SF Symbol on the left and compact elapsed time on the right in the compact activity, with microphone, camera and End controls in the sneak peek.
+Shows a detected WhatsApp call in the macOS notch: a tilted green `phone.fill` SF Symbol on the left and the live waveform on the right in the compact activity, with microphone, camera and End controls in the sneak peek.
 
 An independent community integration. WhatsApp's Accessibility and web interfaces can change; detection and control availability depend on the installed app/browser and permissions.
 
@@ -48,19 +48,18 @@ Desktop detection needs Accessibility permission for the plugin's host in System
 
 Web detection uses Apple Events in Safari, Safari Technology Preview, Chrome, Edge, Brave, Arc, Vivaldi and Chromium. It needs Automation permission and **Allow JavaScript from Apple Events** in the browser's developer settings. Calls are primarily recognized by visible end/mic/camera controls; current web matching uses English control labels and is not guaranteed for every web language.
 
-Real audio levels require the applicable macOS microphone/system-audio authorization. Samples become loudness values in memory; nothing is recorded or sent to a remote service. Orange measures the default microphone, which may differ from WhatsApp's selected input. Green measures the app process, so browser audio may include other tabs. By default only an already-authorized microphone is opened: no microphone permission is requested, and system-audio capture is off. The optional Other Participant Audio setting enables app output capture and may request system-audio permission. Preview sessions never access real audio and use explicitly simulated levels.
+Real audio levels require the applicable macOS microphone/system-audio authorization. Samples become loudness values in memory; nothing is recorded or sent to a remote service. Green is you: it measures the default microphone, which may differ from WhatsApp's selected input. Orange is the other participant: it measures the app process, so browser audio may include other tabs. By default only an already-authorized microphone is opened: no microphone permission is requested, and system-audio capture is off. The optional Other Participant Audio setting enables app output capture and may request system-audio permission. Preview sessions never access real audio and use explicitly simulated levels.
 
 ## Settings
 
 | Setting | Default | Behavior |
 | --- | --- | --- |
-| Compact Appearance | Phone + time | Small phone/time layout; optional phone/waveform layout |
 | Refresh | 1 s | Active-call fallback, 0.5–5 s |
 | WhatsApp Desktop App | on | Native Accessibility detection |
 | WhatsApp Web In Tabs | on | Apple Events browser detection |
 | Fallback Without JavaScript | on | In-call URL fallback with unknown state; an URL alone cannot prove a live call |
 | Diagnostic Activity | off | Synthetic preview without a call or audio capture |
-| Live Waveform | on | Your microphone levels using existing permission |
+| Live Waveform | on | Waveform on the right: your levels, green, using existing permission |
 | Other Participant Audio | off | Optional app output levels; may need system-audio permission |
 
 ## Efficiency and reliability
@@ -71,7 +70,7 @@ Settings are read at most once every 5 seconds. The run loop services events bet
 
 Meters close when hidden, disabled or ended. The microphone is released when mute state is unknown or muted, or its permission is unavailable. Waveform updates affect only the compact surface and skip unchanged frames, reusing unchanged waveform images. A setting change also updates the full activity.
 
-A dismissal stays attached to the same detected session despite mic/camera changes. A quiet gap clears it for a subsequent call; URL-only leftovers need a longer quiet period. Very rapid consecutive calls in the same app may be indistinguishable if no quiet gap is observed. The phone and elapsed time use separate native slots and the activity requests small size. Time mode updates once per second and never opens audio capture. Waveform mode replaces the right-hand time with green far-end bars followed by orange microphone bars. When app-output capture is disabled, the green bars remain flat; they never mirror the microphone. Socket disconnects and malformed frame lengths terminate the monitor clearly; DynamicLake is responsible for restarting it.
+A dismissal stays attached to the same detected session despite mic/camera changes. A quiet gap clears it for a subsequent call; URL-only leftovers need a longer quiet period. Very rapid consecutive calls in the same app may be indistinguishable if no quiet gap is observed. The tilted green phone symbol owns the left slot as a native symbol and the live waveform owns the right one; the activity requests the middle (normal) compact size. The compact surface only updates when the waveform changes, and never opens audio capture just to show state. Your microphone draws green bars on the left half of the waveform and the far end draws orange bars on the right half. When app-output capture is disabled the orange bars remain flat; they never mirror the microphone. Socket disconnects and malformed frame lengths terminate the monitor clearly; DynamicLake is responsible for restarting it.
 
 ## Diagnostics
 
