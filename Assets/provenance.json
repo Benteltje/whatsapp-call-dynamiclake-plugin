@@ -1,0 +1,13 @@
+{
+  "asset": "WhatsAppCallIcon.png",
+  "appearance": "Official default/light green WhatsApp macOS icon",
+  "source": "/Applications/WhatsApp.app/Contents/Resources/AppIcon.icns",
+  "appVersion": "26.38.74",
+  "brandResources": "https://www.meta.com/brand/resources/whatsapp/whatsapp-brand/",
+  "sourceSHA256": "0f97dc1415b1daf9c945268d8baad7d7188194ba0027d9c9a0fa1f16397effc3",
+  "iconSHA256": "8e1b6fc53437aa7d1a9bdc777ecf6edf6937317d2e1d9202e0881788728eb90b",
+  "inlineAsset": "Assets/WhatsAppLightIcon.png",
+  "inlineSHA256": "490f2977b99fc8b0cd074d059d8363611feb20bf472391193cd8550618c32569",
+  "conversion": "sips PNG export; inline rendition resized to 128 pixels",
+  "owner": "WhatsApp LLC / Meta"
+}

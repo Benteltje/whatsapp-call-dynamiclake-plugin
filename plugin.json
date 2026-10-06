@@ -2,9 +2,9 @@
   "schemaVersion": 1,
   "identifier": "com.dynamiclake.plugins.whatsapp-call",
   "name": "WhatsApp Call",
-  "version": "1.0.0",
+  "version": "1.1.3",
   "developerName": "Benteltje",
-  "description": "Shows an active WhatsApp call in the notch: call icon and elapsed time with a live waveform — your voice in green, the other participant in orange — plus microphone, End call and camera controls. Detects calls in the WhatsApp desktop app and in web.whatsapp.com browser tabs.",
+  "description": "Compact WhatsApp call activity: green phone on the left and elapsed time on the right, with microphone, End call and camera controls. Optional waveform layout.",
   "executable": "whatsapp-call-monitor",
   "icon": "WhatsAppCallIcon.png",
   "arguments": [],
@@ -12,9 +12,28 @@
   "supportsSneakPeek": true,
   "settings": [
     {
+      "id": "compactPresentation",
+      "title": "Compact Appearance",
+      "description": "Phone and time is the small default. Choose the waveform layout to display audio levels instead of elapsed time.",
+      "type": "select",
+      "default": "Phone + time",
+      "options": [
+        {
+          "title": "Phone + time",
+          "systemImage": "clock"
+        },
+        {
+          "title": "Phone + waveform",
+          "systemImage": "waveform"
+        }
+      ],
+      "systemImage": "phone.fill",
+      "tint": "green"
+    },
+    {
       "id": "pollSeconds",
       "title": "Refresh",
-      "description": "How often the plugin checks for an active WhatsApp call.",
+      "description": "Active-call fallback interval. Idle checks slow to 3 seconds; closed apps to 15 seconds.",
       "type": "slider",
       "default": 1,
       "min": 0.5,
@@ -62,11 +81,20 @@
     {
       "id": "showWaveform",
       "title": "Live Waveform",
-      "description": "Your voice in green, the other participant in orange, animated while a call runs.",
+      "description": "Live levels from your already-authorized microphone. No new microphone permission prompt.",
       "type": "switch",
       "default": true,
       "systemImage": "waveform",
       "tint": "green"
+    },
+    {
+      "id": "captureAppAudio",
+      "title": "Other Participant Audio",
+      "description": "Capture the call app audio as well. Optional: macOS may request system audio recording permission.",
+      "type": "switch",
+      "default": false,
+      "systemImage": "speaker.wave.2.fill",
+      "tint": "orange"
     }
   ]
 }

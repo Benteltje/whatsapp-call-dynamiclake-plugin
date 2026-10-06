@@ -1,0 +1,20 @@
+name: Build and test
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build universal package and test without real calls
+        run: ./tests/run.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhatsAppCall-package
+          path: dist/*
+          if-no-files-found: error
