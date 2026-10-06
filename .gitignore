@@ -1,8 +1,5 @@
-# Build output — build it yourself with `swiftc`, see README ▸ Building
+build/
+dist/
 whatsapp-call-monitor
-
-# Distributable package
 *.zip
-
-# macOS
 .DS_Store
