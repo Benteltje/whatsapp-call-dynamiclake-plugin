@@ -17,6 +17,7 @@ root = Path(__file__).resolve().parents[1]
 manifest = json.loads((root / 'plugin.json').read_text())
 package = binary.parent
 assert manifest['executable'] == binary.name
+assert {s['id'] for s in manifest['settings']} == {'pollSeconds', 'detectNativeCalls', 'diagnosticActivity', 'showWaveform', 'captureAppAudio'}
 assert (package / manifest['icon']).is_file()
 architectures = subprocess.check_output(['lipo', '-archs', str(binary)], text=True).split()
 assert set(architectures) == {'arm64', 'x86_64'}
@@ -44,16 +45,16 @@ assert len(payload) < 65536
 sample = json.loads(payload)
 left = sample['surfaces']['compactLiveActivity']['leftSlot']
 assert left['source'] == 'sfSymbol' and left['systemImage'] == 'phone.fill' and left['tint'] == 'green'
-assert sample['size'] == 'small'
+assert sample['size'] == 'normal'
 right = sample['surfaces']['compactLiveActivity']['rightSlot']
-assert right['type'] == 'text' and right['text'] == '0:44'
+assert right['source'] == 'inlineData' and right['mimeType'] == 'image/png'
 assert (package / 'Assets/WhatsAppLightIcon.png').is_file()
 
 with tempfile.TemporaryDirectory(prefix='wa-test-', dir='/tmp') as directory:
     directory = Path(directory)
     settings = directory / 'settings.json'
     def save(**changes):
-        values = dict(detectNativeCalls=False, detectWebCalls=False, diagnosticActivity=True, showWaveform=True, pollSeconds=0.5)
+        values = dict(detectNativeCalls=False, diagnosticActivity=True, showWaveform=True, pollSeconds=0.5)
         values.update(changes)
         temporary = settings.with_suffix('.tmp')
         temporary.write_text(json.dumps({'values': values}))
@@ -95,11 +96,11 @@ with tempfile.TemporaryDirectory(prefix='wa-test-', dir='/tmp') as directory:
             else: conn.sendall(frame)
         initial = receive()
         assert initial['type'] == 'create'
-        assert initial['size'] == 'small'
-        first_time = initial['surfaces']['compactLiveActivity']['rightSlot']['text']
-        until(lambda f: f.get('surfaces', {}).get('compactLiveActivity', {}).get('rightSlot', {}).get('text') not in [None, first_time])
+        assert initial['size'] == 'normal'
+        first_image = initial['surfaces']['compactLiveActivity']['rightSlot']['base64Data']
+        until(lambda f: f.get('surfaces', {}).get('compactLiveActivity', {}).get('rightSlot', {}).get('base64Data') not in [None, first_image])
         send({'type':'response', 'ok':True})
-        save(compactPresentation='Phone + waveform')
+        save(captureAppAudio=True)
         wave = until(lambda f: 'sneakPeek' in f.get('surfaces', {}) and f['type'] == 'update')
         image = wave['surfaces']['compactLiveActivity']['rightSlot']
         assert image['source'] == 'inlineData' and image['mimeType'] == 'image/png'
@@ -109,8 +110,15 @@ with tempfile.TemporaryDirectory(prefix='wa-test-', dir='/tmp') as directory:
         until(lambda f: f.get('surfaces', {}).get('compactLiveActivity', {}).get('rightSlot', {}).get('base64Data') not in [None, first_image])
         save(showWaveform=False)
         frame = until(lambda f: 'sneakPeek' in f.get('surfaces', {}) and f['type'] == 'update')
-        assert frame['surfaces']['compactLiveActivity']['rightSlot']['type'] == 'text'
-        assert frame['size'] == 'small'
+        assert 'rightSlot' not in frame['surfaces']['compactLiveActivity']
+        assert frame['size'] == 'normal'
+        conn.settimeout(2)
+        try:
+            receive()
+            raise AssertionError('disabled waveform emitted a redundant frame')
+        except socket.timeout:
+            pass
+        conn.settimeout(8)
         send({'type':'action', 'actionID':'dismiss'}, fragmented=True)
         until(lambda f: f['type'] == 'dismiss')
         conn.settimeout(2)
@@ -140,7 +148,7 @@ with tempfile.TemporaryDirectory(prefix='wa-bad-', dir='/tmp') as directory:
     path = directory + '/socket'
     listener.bind(path); listener.listen(1); listener.settimeout(5)
     settings = directory + '/settings.json'
-    Path(settings).write_text(json.dumps({'detectNativeCalls':False,'detectWebCalls':False}))
+    Path(settings).write_text(json.dumps({'detectNativeCalls':False}))
     env.update(DYNAMICLAKE_JSON_SOCKET=path, DYNAMICLAKE_PLUGIN_SETTINGS_PATH=settings)
     process = subprocess.Popen([str(binary)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:

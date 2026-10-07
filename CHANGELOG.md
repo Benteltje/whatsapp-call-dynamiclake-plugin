@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.2.8
+
+- Focus detection and call controls exclusively on the native WhatsApp macOS app.
+- Simplify session identity and dismissal tracking around native call windows.
+- Reduce settings and test dependencies to the native integration.
+
+## 1.2.7
+
+- Slightly reduce waveform gain from 1.25 to 1.15 (8% lower for bars below the height limit), keeping quiet speech visible.
+
+## 1.2.6
+
+- Reduce idle socket checks from four to one per second, slow absent-app observer retries to 15 seconds and coalesce idle AX events over 0.75 seconds.
+- Disable continuous audio diagnostics by default and omit unchanged waveform updates when only elapsed time changes.
+- Make quiet speech more visible with a compressed gain curve, a lower silence gate and faster peak recovery. Reset calibration between calls.
+- Draw your microphone in orange and remote app output in green. Muted input remains gray; remote audio capture stays optional.
+- Refresh stale integration expectations to cover the current compact waveform layout.
+
 ## 1.2.5
 
 - Fix the waveform freezing when the call connects while you are already talking: the microphone engine used to be interrupted by the call app taking the input, hold its last level forever, and the unchanged-frame guard then suppressed every update. The meter now detects a stalled input (no buffer for 0.5 s), draws flat instead of a stale value, and restarts the engine automatically (at most once per 3 s).
@@ -75,18 +93,15 @@
 - Universal arm64/x86_64 build, installable package, versioned ZIP and SHA-256 checksum.
 - macOS CI and tested tag-based GitHub releases.
 - Workspace lifecycle and Accessibility event monitoring, with 3-second idle and 15-second closed-app fallback checks.
-- Browser scans bounded to 4 seconds with active-browser priority and rotating fallback order.
 - Unchanged waveform PNGs are cached.
 - Settings cached for 5 seconds; waveform setting changes republish the full surface.
 - Accessibility reads bounded by node count and elapsed time.
 - Disconnect, oversized incoming frames, SIGPIPE and stalled socket writes handled explicitly.
-- Child-process output no longer fills undrained pipes.
 - Dismissal identity remains stable across microphone/camera changes.
 - Preview/test sessions never open real microphones or process audio taps.
-- Exact WhatsApp Web host checks and tab URL revalidation before actions.
 - Replace macOS 27-only microphone API with the compatible AVAudioEngine tap API.
 - Safe self-tests and local socket integration tests without real calls.
 
 ## 1.0.0
 
-- Initial desktop/web call detection, controls and audio waveform.
+- Initial native call detection, controls and audio waveform.
