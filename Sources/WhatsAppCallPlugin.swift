@@ -16,14 +16,14 @@ private let socketEnvironmentKey = "DYNAMICLAKE_JSON_SOCKET"
 private let settingsPathEnvironmentKey = "DYNAMICLAKE_PLUGIN_SETTINGS_PATH"
 private let testSessionEnvironmentKey = "DYNAMICLAKE_WHATSAPP_CALL_TEST_SESSION"
 private let maxFrameSize = 64 * 1024
-private let fieldSeparator = "<<<DYNAMICLAKE_FIELD>>>"
 private let timerMaximumDuration: TimeInterval = 48 * 60 * 60
 private let actionLoopInterval: TimeInterval = 0.05
+private let verboseAudioDiagnostics = ProcessInfo.processInfo.environment["DYNAMICLAKE_WHATSAPP_DEBUG"] == "1"
 
 /// Cadence of the waveform animation: fast enough to read as movement, slow
 /// enough that the inline PNG frames stay cheap on the local socket.
 private let waveformInterval: TimeInterval = 0.12
-/// Bars per side — your microphone on the left in green, the far end on the right in orange.
+/// Bars per side — your microphone on the left in orange, the far end on the right in green.
 private let waveformBarsPerSide = 7
 private let waveformWidth = 100
 private let waveformHeight = 28
@@ -32,47 +32,29 @@ private let waveformHeight = 28
 private let micStaleSeconds: TimeInterval = 0.5
 
 /// The widest compact geometry: a 351 x 33 pt panel with 77 pt side slots, which
-/// is what the phone icon, the elapsed time and the waveform need together.
+/// provides room for the phone icon and the waveform together.
 private let activitySize = "normal"
 
 /// Silence required before a dismissal of a known call is forgotten, so the
 /// next call in the same app shows again. One quiet poll is already a closed
 /// window; the small margin absorbs a single failed detection.
 private let quietForgetSeconds: TimeInterval = 3
-/// The same, for URL-only detection: it drops out and returns every couple of
-/// seconds, so only a long stretch of silence counts as "the tab is gone".
-private let statelessQuietSeconds: TimeInterval = 60
-/// How long after a call ends a URL-only tab is assumed to be its leftover
-/// rather than a new call.
-private let leftoverWatchSeconds: TimeInterval = 45
-
 /// AXIdentifier of the group WhatsApp mounts in its call window. Identifiers are
 /// not localized, which is why detection uses it instead of the window title.
 private let callWindowIdentifier = "Calling_Window"
 private let whatsappBundleIdentifier = "net.whatsapp.WhatsApp"
-
-private let safariJavaScriptHint = "Safari ▸ Settings ▸ Advanced ▸ Show features for web developers, then Develop ▸ Developer Settings ▸ Allow JavaScript from Apple Events"
-private let chromeJavaScriptHint = "Chrome (and other Chromium browsers) ▸ View ▸ Developer ▸ Allow JavaScript from Apple Events"
-
-private let iso8601Formatter: ISO8601DateFormatter = {
-    let formatter = ISO8601DateFormatter()
-    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-    return formatter
-}()
 
 // MARK: - Settings
 
 private struct PluginSettings: Equatable, CustomStringConvertible {
     var pollSeconds: TimeInterval = 1
     var detectNativeCalls = true
-    var detectWebCalls = true
-    var webUrlFallback = true
     var diagnosticActivity = false
     var showWaveform = true
     var captureAppAudio = false
 
     var description: String {
-        "PluginSettings(pollSeconds: \(pollSeconds), detectNativeCalls: \(detectNativeCalls), detectWebCalls: \(detectWebCalls), webUrlFallback: \(webUrlFallback), diagnosticActivity: \(diagnosticActivity), showWaveform: \(showWaveform), captureAppAudio: \(captureAppAudio))"
+        "PluginSettings(pollSeconds: \(pollSeconds), detectNativeCalls: \(detectNativeCalls), diagnosticActivity: \(diagnosticActivity), showWaveform: \(showWaveform), captureAppAudio: \(captureAppAudio))"
     }
 }
 
@@ -140,8 +122,6 @@ private func loadSettings(previous: PluginSettings? = nil) -> PluginSettings {
     return PluginSettings(
         pollSeconds: doubleValue(settingValue(values, id: "pollSeconds", default: 1), default: 1, minimum: 0.5, maximum: 5),
         detectNativeCalls: boolValue(settingValue(values, id: "detectNativeCalls", default: true), default: true),
-        detectWebCalls: boolValue(settingValue(values, id: "detectWebCalls", default: true), default: true),
-        webUrlFallback: boolValue(settingValue(values, id: "webUrlFallback", default: true), default: true),
         diagnosticActivity: boolValue(settingValue(values, id: "diagnosticActivity", default: false), default: false),
         showWaveform: boolValue(settingValue(values, id: "showWaveform", default: true), default: true),
         captureAppAudio: boolValue(settingValue(values, id: "captureAppAudio", default: false), default: false)
@@ -347,167 +327,6 @@ private func debugLog(_ message: String) {
     } else {
         try? line.write(to: url, atomically: true, encoding: .utf8)
     }
-}
-
-// MARK: - Process helpers
-
-private struct ProcessResult {
-    let status: Int32
-    let stdout: String
-    let stderr: String
-}
-
-private var browserScanDeadline: Date?
-
-private func runProcess(executable: String, arguments: [String], timeout: TimeInterval, context: String? = nil) -> ProcessResult? {
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
-
-    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("whatsapp-process-\(UUID().uuidString)")
-    do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700]) }
-    catch { return nil }
-    defer { try? FileManager.default.removeItem(at: directory) }
-    let stdoutURL = directory.appendingPathComponent("stdout")
-    let stderrURL = directory.appendingPathComponent("stderr")
-    FileManager.default.createFile(atPath: stdoutURL.path, contents: nil)
-    FileManager.default.createFile(atPath: stderrURL.path, contents: nil)
-    guard let stdoutHandle = try? FileHandle(forWritingTo: stdoutURL),
-          let stderrHandle = try? FileHandle(forWritingTo: stderrURL) else { return nil }
-    process.standardOutput = stdoutHandle
-    process.standardError = stderrHandle
-    defer { try? stdoutHandle.close(); try? stderrHandle.close() }
-
-    do {
-        try process.run()
-    } catch {
-        if let context {
-            debugLog("process failed context=\(context) error=\(error.localizedDescription)")
-        }
-        return nil
-    }
-
-    let deadline = min(Date().addingTimeInterval(timeout), browserScanDeadline ?? .distantFuture)
-    while process.isRunning && Date() < deadline {
-        Thread.sleep(forTimeInterval: 0.02)
-    }
-
-    if process.isRunning {
-        process.terminate()
-        Thread.sleep(forTimeInterval: 0.05)
-        if process.isRunning {
-            Darwin.kill(process.processIdentifier, SIGKILL)
-        }
-        while process.isRunning {
-            Thread.sleep(forTimeInterval: 0.01)
-        }
-        if let context {
-            debugLog("process timeout context=\(context)")
-        }
-        return nil
-    }
-
-    guard let stdoutReader = try? FileHandle(forReadingFrom: stdoutURL),
-          let stderrReader = try? FileHandle(forReadingFrom: stderrURL) else { return nil }
-    defer { try? stdoutReader.close(); try? stderrReader.close() }
-    let stdoutData = stdoutReader.readData(ofLength: maxFrameSize)
-    let stderrData = stderrReader.readData(ofLength: 4096)
-    return ProcessResult(
-        status: process.terminationStatus,
-        stdout: String(data: stdoutData, encoding: .utf8) ?? "",
-        stderr: String(data: stderrData, encoding: .utf8) ?? ""
-    )
-}
-
-private func runAppleScript(_ script: String, timeout: TimeInterval = 3, context: String? = nil) -> String? {
-    runAppleScriptCapturingError(script, timeout: timeout, context: context ?? "appleScript").output
-}
-
-/// Keeps the failure text so callers can tell a blocked capability (Apple
-/// Events permission, JavaScript from Apple Events) apart from a missing tab.
-private func runAppleScriptCapturingError(
-    _ script: String,
-    timeout: TimeInterval,
-    context: String
-) -> (output: String?, detail: String?) {
-    guard let result = runProcess(executable: "/usr/bin/osascript", arguments: ["-e", script], timeout: timeout, context: context) else {
-        return (nil, "timeout")
-    }
-
-    guard result.status == 0 else {
-        let detail = (result.stderr.isEmpty ? result.stdout : result.stderr)
-            .split(separator: "\n")
-            .first
-            .map(String.init) ?? "unknown"
-        debugLog("osascript failed context=\(context) status=\(result.status)")
-        return (nil, detail)
-    }
-
-    return (result.stdout.trimmingCharacters(in: .whitespacesAndNewlines), nil)
-}
-
-private func appleString(_ value: String) -> String {
-    value
-        .replacingOccurrences(of: "\\", with: "\\\\")
-        .replacingOccurrences(of: "\"", with: "\\\"")
-}
-
-/// True when the browser refused the script because the developer setting that
-/// allows Apple Events to run JavaScript is switched off.
-private func safariJavaScriptBlocked(_ detail: String?) -> Bool {
-    guard let detail else { return false }
-    let lowered = detail.lowercased()
-    return lowered.contains("javascript from apple events") || lowered.contains("not allowed")
-}
-
-private func appleAppReference(for appName: String) -> String {
-    let home = FileManager.default.homeDirectoryForCurrentUser.path
-    let candidates = [
-        "/Applications/\(appName).app",
-        "\(home)/Applications/\(appName).app",
-        "/System/Volumes/Preboot/Cryptexes/App/System/Applications/\(appName).app",
-        "/System/Cryptexes/App/System/Applications/\(appName).app"
-    ]
-
-    for candidate in candidates where FileManager.default.fileExists(atPath: candidate) {
-        return appleString(candidate)
-    }
-
-    return appleString(appName)
-}
-
-private func appIsRunning(_ appName: String) -> Bool {
-    NSWorkspace.shared.runningApplications.contains { application in
-        if application.localizedName == appName { return true }
-        if application.bundleURL?.lastPathComponent == "\(appName).app" { return true }
-        if application.executableURL?.lastPathComponent == appName { return true }
-        return false
-    }
-}
-
-/// Per-browser retry delay after its detection script fails or times out, so a
-/// browser that never answers (a pending Automation prompt) is not sent a new
-/// osascript every poll.
-private var detectionBackoff: [String: (failures: Int, retryAt: Date)] = [:]
-private let detectionBackoffMaximum: TimeInterval = 60
-
-private func detectionAllowed(for appName: String) -> Bool {
-    guard let entry = detectionBackoff[appName] else { return true }
-    return Date() >= entry.retryAt
-}
-
-private func recordDetection(for appName: String, succeeded: Bool) {
-    if succeeded {
-        if let entry = detectionBackoff.removeValue(forKey: appName) {
-            debugLog("detect \(appName) recovered after \(entry.failures) failures")
-        }
-        return
-    }
-
-    let failures = (detectionBackoff[appName]?.failures ?? 0) + 1
-    let delay = min(detectionBackoffMaximum, pow(2, Double(failures - 1)))
-    detectionBackoff[appName] = (failures, Date().addingTimeInterval(delay))
-    debugLog("detect \(appName) failed \(failures)x; next attempt in \(Int(delay))s")
 }
 
 // MARK: - Accessibility helpers
@@ -743,7 +562,7 @@ private func defaultOutputDeviceUID() -> String? {
 /// - **orange** — your microphone, so it only moves when you actually talk.
 /// - **green** — the call application's *output* stream, which during a call
 ///   is the other participant's voice. It is read with a CoreAudio process tap
-///   pointed at WhatsApp (or the browser on the web), so music in another app
+///   pointed at WhatsApp, so music in another app
 ///   never lights it up.
 ///
 /// Sources are opened when a call starts and closed when it ends. Anything
@@ -816,8 +635,7 @@ private final class WaveformMeter {
     }
 
     /// Opens whatever is missing. The microphone belongs to this process rather
-    /// than to the call, so it stays open while detection flips between the
-    /// desktop app and a browser tab — only the process tap is retargeted.
+    /// than to the call, so it stays open across native state refreshes.
     func ensureRunning(targetPID pid: pid_t, micWanted: Bool, tapWanted: Bool) {
         lock.lock()
         let micOpen = engine != nil
@@ -847,7 +665,7 @@ private final class WaveformMeter {
                 lock.unlock()
             }
         } else if micOpen {
-            // Muted, or state unknown: the green side is drawn flat anyway, so
+            // Muted, or state unknown: the orange side is drawn flat anyway, so
             // keeping an input stream open only costs memory for nothing.
             stopMicrophone()
         }
@@ -1102,23 +920,21 @@ private func inputDeviceName() -> String {
     return name as String
 }
 
-/// Bar height for one raw RMS reading, relative to the loudest recent moment.
-/// Normal talking sits around half the bar, peaks reach the top, and only true
-/// silence sits at the bottom — whatever the microphone's gain happens to be.
+/// Compress the dynamic range so quiet speech remains visible after louder
+/// words. Gate actual silence before applying gain; never amplify zero input.
 private func scaledLevel(_ level: Float, peak: Float) -> Float {
-    let silenceFloor: Float = 0.001 // −60 dBFS: true silence only; quiet voices must pass
-    guard level > 0, peak >= silenceFloor else { return 0 }
-    return min(max(level / peak, 0), 1)
+    let silenceFloor: Float = 0.0001 // −80 dBFS, for low-gain microphones
+    guard level.isFinite, peak.isFinite, level > silenceFloor else { return 0 }
+    let relative = level / max(peak, silenceFloor)
+    return min(sqrt(max(relative, 0)) * 1.15, 1)
 }
 
-/// Attack on a new loud moment, but one tick may raise the reference by at
-/// most ~12 dB so a single device click cannot pin it above a real voice; then
-/// release slowly (about 6 dB per 15 s) so pauses do not reset it.
+/// Limit transient attacks and recover from loud words in a few seconds.
 private func updatedPeak(_ peak: Float, _ level: Float) -> Float {
-    let silenceFloor: Float = 0.001
+    let silenceFloor: Float = 0.0001
     if peak < silenceFloor { return level }
     if level > peak { return min(level, peak * 4) }
-    return peak * 0.9945
+    return max(silenceFloor, peak * 0.96)
 }
 
 private func renderWaveformPNG(you: [Float], them: [Float], youMuted: Bool) -> Data? {
@@ -1158,44 +974,22 @@ private func renderWaveformPNG(you: [Float], them: [Float], youMuted: Bool) -> D
         context.fillPath()
     }
 
-    // Your microphone leads in green, the far end follows in orange — green is
-    // you talking, orange is the other participant.
+    // Your microphone leads in orange; the remote participants follow in green.
     for (index, value) in you.enumerated() {
-        draw(index, youMuted ? 0 : value, youMuted ? gray : green)
+        draw(index, youMuted ? 0 : value, youMuted ? gray : orange)
     }
     for (index, value) in them.enumerated() {
-        draw(you.count + index, value, orange)
+        draw(you.count + index, value, green)
     }
 
     guard let image = context.makeImage() else { return nil }
     return pngData(from: image)
 }
 
-/// Which process carries the call audio: WhatsApp itself for a native call,
-/// the browser tab's app for a web call. Fake sessions return nil, which leaves
-/// the meters closed.
+/// Synthetic sessions never open audio capture.
 private func waveformTargetPID(for session: CallSession) -> pid_t? {
-    if let pid = session.axPID { return pid }
-
-    guard session.kind == "web" else { return nil }
-
-    return NSWorkspace.shared.runningApplications.first { $0.localizedName == session.appName }?
-        .processIdentifier
+    session.kind == "native" ? session.axPID : nil
 }
-
-    /// Identity of a *call* as far as detection can see it. The same live call
-    /// keeps the same token across detection flaps, while a new call or a tab
-    /// that now reports a real microphone/camera state gets a different one.
-    private func sessionToken(_ session: CallSession) -> String {
-        [session.key, session.url ?? "", isStatelessSession(session) ? "fallback" : "known"].joined(separator: "|")
-    }
-
-    /// A session with neither microphone nor camera state came from the in-call
-    /// URL fallback: nothing in it proves the call is still running, so hiding it
-    /// has to survive until the tab reports something else.
-    private func isStatelessSession(_ session: CallSession) -> Bool {
-        session.kind == "web" && session.micMuted == nil && session.cameraOn == nil
-    }
 
 // MARK: - Sessions
 
@@ -1203,28 +997,18 @@ private final class CallSession {
     let key: String
     let kind: String
     let title: String
-    let url: String?
-    let browserName: String
-    let appName: String
-    let windowIndex: Int?
-    let tabIndex: Int?
     /// Present for native sessions; the AX element itself is re-resolved per action.
     let axPID: pid_t?
     var startedAt: TimeInterval
     var micMuted: Bool?
     var cameraOn: Bool?
-    /// Free-form state used by `--check` (call window title, web control labels).
+    /// Free-form native call state used by `--check`.
     var detail: String = ""
 
     init(
         key: String,
         kind: String,
         title: String,
-        url: String?,
-        browserName: String,
-        appName: String,
-        windowIndex: Int? = nil,
-        tabIndex: Int? = nil,
         axPID: pid_t? = nil,
         startedAt: TimeInterval,
         micMuted: Bool? = nil,
@@ -1233,11 +1017,6 @@ private final class CallSession {
         self.key = key
         self.kind = kind
         self.title = title
-        self.url = url
-        self.browserName = browserName
-        self.appName = appName
-        self.windowIndex = windowIndex
-        self.tabIndex = tabIndex
         self.axPID = axPID
         self.startedAt = startedAt
         self.micMuted = micMuted
@@ -1333,9 +1112,6 @@ private func detectNativeCall() -> CallSession? {
         key: "native",
         kind: "native",
         title: "WhatsApp",
-        url: nil,
-        browserName: "WhatsApp",
-        appName: "WhatsApp",
         axPID: whatsappApplication()?.processIdentifier,
         startedAt: Date().timeIntervalSince1970,
         micMuted: state.micMuted,
@@ -1390,301 +1166,6 @@ private func pressNativeControl(pid: pid_t, control: String) -> Bool {
     return false
 }
 
-// MARK: - Web detection
-
-private struct BrowserSpec {
-    let appName: String
-    let displayName: String
-    /// "safari" uses `do JavaScript`, Chromium browsers use `execute ... javascript`.
-    let kind: String
-}
-
-private let browserSpecs: [BrowserSpec] = [
-    BrowserSpec(appName: "Safari", displayName: "Safari", kind: "safari"),
-    BrowserSpec(appName: "Safari Technology Preview", displayName: "Safari Technology Preview", kind: "safari"),
-    BrowserSpec(appName: "Google Chrome", displayName: "Chrome", kind: "chrome"),
-    BrowserSpec(appName: "Google Chrome Beta", displayName: "Chrome Beta", kind: "chrome"),
-    BrowserSpec(appName: "Google Chrome Canary", displayName: "Chrome Canary", kind: "chrome"),
-    BrowserSpec(appName: "Microsoft Edge", displayName: "Edge", kind: "chrome"),
-    BrowserSpec(appName: "Brave Browser", displayName: "Brave", kind: "chrome"),
-    BrowserSpec(appName: "Arc", displayName: "Arc", kind: "chrome"),
-    BrowserSpec(appName: "Vivaldi", displayName: "Vivaldi", kind: "chrome"),
-    BrowserSpec(appName: "Chromium", displayName: "Chromium", kind: "chrome")
-]
-
-private let webURLMarker = "web.whatsapp.com"
-
-private struct WebTab {
-    let windowIndex: Int
-    let tabIndex: Int
-    let title: String
-    let url: String
-}
-
-/// Reads a WhatsApp Web tab and reports whether a call is on screen together
-/// with whatever the control labels say about the microphone and camera.
-///
-/// Output: `active|mic|camera|detail`
-///   active  - `1` when call controls are visible, otherwise `0`
-///   mic     - `muted`, `live` or `unknown`
-///   camera  - `on`, `off` or `unknown`
-///   detail  - the matched control labels, for `--check` and the debug log
-private let webCallStateJavaScript = #"""
-(function(){
-const vis=function(e){const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>4&&r.height>4&&s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0';};
-const nm=function(e){return [e.getAttribute('aria-label'),e.getAttribute('data-testid'),e.getAttribute('title'),(e.innerText||'').trim()].filter(Boolean).join(' ').replace(/[|]/g,'/').replace(/\s+/g,' ').trim();};
-const els=Array.from(document.querySelectorAll('button,[role="button"],[role="switch"],[data-testid]')).filter(vis);
-const blocked=/device|setting|permission|select|choose|screen|share|background|effect|change|more|input|output|speaker|headset|bluetooth|arrow|dropdown|collapse|panel|sidebar|reaction|sticker|emoji|search/i;
-const micRe=/microphone|\bmic\b|mute|unmute/i;
-const camRe=/camera|video|videocam/i;
-const endRe=/end call|leave call|hang up|cancel call|decline|quit call|stop call|end call now/i;
-let mic=null,cam=null,end=null;
-for(const e of els){
-const t=nm(e); if(!t) continue;
-if(!end&&endRe.test(t)) end=e;
-if(!mic&&micRe.test(t)&&!blocked.test(t)) mic=e;
-if(!cam&&camRe.test(t)&&!blocked.test(t)) cam=e;
-}
-const testids=Array.from(document.querySelectorAll('[data-testid]')).map(function(e){return e.getAttribute('data-testid');}).filter(function(v){return /call/i.test(v);}).slice(0,6);
-const active=!!(end&&(mic||cam));
-const pressed=function(e){if(!e)return null;const a=e.getAttribute('aria-pressed')||(e.closest('[aria-pressed]')?.getAttribute('aria-pressed'));if(a==='true')return true;if(a==='false')return false;return null;};
-let micState='unknown';
-if(mic){
-const t=nm(mic),p=pressed(mic);
-if(p===true) micState='muted';
-else if(p===false) micState='live';
-else if(/unmute|turn on|enable|start|activate|microphone (on|active)/i.test(t)) micState='muted';
-else if(/microphone (off|muted)|is muted|\bmuted\b/i.test(t)) micState='muted';
-else if(/\bmute\b|turn off|disable|stop/i.test(t)) micState='live';
-}
-let camState='unknown';
-if(cam){
-const t=nm(cam),p=pressed(cam);
-if(p===true) camState='on';
-else if(p===false) camState='off';
-else if(/turn off|disable|stop|camera off|video off|camera is on/i.test(t)) camState='on';
-else if(/turn on|enable|start|camera on|video on/i.test(t)) camState='off';
-}
-const detail=[mic?nm(mic).slice(0,48):'-',cam?nm(cam).slice(0,48):'-',end?nm(end).slice(0,48):'-',testids.join(',')].join(';').replace(/\|/g,'/');
-return [active?'1':'0',micState,camState,detail].join('|');
-})()
-"""#
-
-/// Clicks the WhatsApp Web microphone or camera control.
-private let webCallToggleJavaScript = #"""
-(function(control){
-const vis=function(e){const r=e.getBoundingClientRect(),s=getComputedStyle(e);return r.width>4&&r.height>4&&s.visibility!=='hidden'&&s.display!=='none'&&s.opacity!=='0';};
-const nm=function(e){return [e.getAttribute('aria-label'),e.getAttribute('data-testid'),e.getAttribute('title'),(e.innerText||'').trim()].filter(Boolean).join(' ');};
-const blocked=/device|setting|permission|select|choose|screen|share|background|effect|change|more|input|output|speaker|headset|bluetooth|arrow|dropdown|collapse|panel|sidebar|reaction|sticker|emoji|search/i;
-const reMap={camera:/camera|video|videocam/i,end:/end call|leave call|hang up|quit call|stop call/i,mic:/microphone|\bmic\b|mute|unmute/i};
-if(location.hostname!=='web.whatsapp.com')return 'wrong host';
-const re=reMap[control];if(!re)return 'unsupported';
-const els=Array.from(document.querySelectorAll('button,[role="button"],[role="switch"]')).filter(vis);
-if(!els.some(e=>/end call|leave call|hang up|quit call|stop call/i.test(nm(e))))return 'no active call';
-for(const e of els){
-const t=nm(e); if(!t||blocked.test(t)) continue;
-if(re.test(t)){ e.click(); return 'clicked '+t.slice(0,60); }
-}
-return 'missing';
-})(#CONTROL#);
-"""#
-
-private func webJavaScript(_ body: String, control: String) -> String {
-    body.replacingOccurrences(of: "#CONTROL#", with: "\"\(control)\"")
-        .split(separator: "\n")
-        .joined(separator: " ")
-}
-
-private func stateJavaScript() -> String {
-    webCallStateJavaScript.split(separator: "\n").joined(separator: " ")
-}
-
-private func enumerateWebTabs(spec: BrowserSpec) -> [WebTab] {
-    let appReference = appleAppReference(for: spec.appName)
-    let titleProperty = spec.kind == "safari" ? "name" : "title"
-    let script = """
-    tell application "\(appReference)"
-        set output to ""
-        set fieldSeparator to "\(fieldSeparator)"
-        set windowCount to 0
-        try
-            set windowCount to count of windows
-        end try
-        repeat with w from 1 to windowCount
-            try
-                set tabCount to count of tabs of window w
-                repeat with t from 1 to tabCount
-                    set tabURL to ""
-                    try
-                        set tabURL to URL of tab t of window w as text
-                    end try
-                    if tabURL contains "\(webURLMarker)" then
-                        set tabTitle to ""
-                        try
-                            set tabTitle to \(titleProperty) of tab t of window w as text
-                        end try
-                        set output to output & w & fieldSeparator & t & fieldSeparator & tabTitle & fieldSeparator & tabURL & linefeed
-                    end if
-                end repeat
-            end try
-        end repeat
-        return output
-    end tell
-    """
-
-    guard let output = runAppleScript(script, context: "tabs \(spec.appName)") else {
-        recordDetection(for: spec.appName, succeeded: false)
-        return []
-    }
-    guard !output.isEmpty else {
-        recordDetection(for: spec.appName, succeeded: true)
-        return []
-    }
-
-    return output.split(separator: "\n", omittingEmptySubsequences: true).compactMap { line in
-        let parts = String(line).components(separatedBy: fieldSeparator)
-        guard parts.count == 4, URL(string: parts[3])?.host?.lowercased() == webURLMarker, let windowIndex = Int(parts[0]), let tabIndex = Int(parts[1]) else { return nil }
-        return WebTab(windowIndex: windowIndex, tabIndex: tabIndex, title: parts[2], url: parts[3])
-    }
-}
-
-private func executeWebJavaScript(spec: BrowserSpec, tab: WebTab, script: String) -> (output: String?, detail: String?) {
-    let appReference = appleAppReference(for: spec.appName)
-    let evaluate = spec.kind == "safari"
-        ? "return do JavaScript jsCode in targetTab"
-        : "return execute targetTab javascript jsCode"
-
-    let source = """
-    tell application "\(appReference)"
-        set targetTab to tab \(tab.tabIndex) of window \(tab.windowIndex)
-        set jsCode to "\(appleString(script))"
-        \(evaluate)
-    end tell
-    """
-
-    return runAppleScriptCapturingError(source, timeout: 3, context: "javascript \(spec.appName)")
-}
-
-private func parseWebState(_ output: String?) -> (active: Bool, micMuted: Bool?, cameraOn: Bool?, detail: String)? {
-    guard let output else { return nil }
-    let parts = output.components(separatedBy: "|")
-    guard parts.count >= 4 else { return nil }
-
-    let mic: Bool?
-    switch parts[1] {
-    case "muted": mic = true
-    case "live": mic = false
-    default: mic = nil
-    }
-
-    let camera: Bool?
-    switch parts[2] {
-    case "on": camera = true
-    case "off": camera = false
-    default: camera = nil
-    }
-
-    return (parts[0] == "1", mic, camera, parts[3])
-}
-
-/// `web.whatsapp.com/call/...` is WhatsApp Web's in-call URL. It is only a
-/// fallback: JavaScript is what actually decides whether a call is live, and
-/// this URL shape is used solely when Apple Events JavaScript is unavailable.
-private func isWebCallURL(_ url: String) -> Bool {
-    guard let parsed = URL(string: url), parsed.scheme == "https", parsed.host?.lowercased() == webURLMarker else { return false }
-    return parsed.path.hasPrefix("/call/")
-}
-
-/// Returns only sessions that are really live. A browser that refuses to run
-/// JavaScript must never be reported as an active call, otherwise the activity
-/// would never be dismissed.
-private var nextBrowserScanOffset = 0
-
-private func webSessions(settings: PluginSettings, preferredAppName: String? = nil) -> (sessions: [CallSession], issues: [String]) {
-    browserScanDeadline = Date().addingTimeInterval(4)
-    defer { browserScanDeadline = nil }
-    var sessions: [CallSession] = []
-    var issues: [String] = []
-
-    let offset = nextBrowserScanOffset % browserSpecs.count
-    var ordered = Array(browserSpecs[offset...] + browserSpecs[..<offset])
-    nextBrowserScanOffset = (offset + 1) % browserSpecs.count
-    if let preferredAppName, let index = ordered.firstIndex(where: { $0.appName == preferredAppName }) {
-        ordered.insert(ordered.remove(at: index), at: 0)
-    }
-    for spec in ordered {
-        guard Date() < (browserScanDeadline ?? .distantFuture) else { break }
-        guard appIsRunning(spec.appName) else {
-            detectionBackoff[spec.appName] = nil
-            continue
-        }
-        guard detectionAllowed(for: spec.appName) else {
-            issues.append("- \(spec.displayName): skipping, still backing off after an earlier failure")
-            continue
-        }
-
-        let tabs = enumerateWebTabs(spec: spec)
-        if tabs.isEmpty {
-            issues.append("- \(spec.displayName): no \(webURLMarker) tabs")
-            continue
-        }
-
-        for tab in tabs {
-            guard Date() < (browserScanDeadline ?? .distantFuture) else { break }
-            let key = "web:\(spec.appName):\(tab.windowIndex):\(tab.tabIndex)"
-            let evaluated = executeWebJavaScript(spec: spec, tab: tab, script: stateJavaScript())
-
-            guard let output = evaluated.output, let state = parseWebState(output) else {
-                recordDetection(for: spec.appName, succeeded: false)
-                let detail = evaluated.detail ?? "no result"
-                issues.append("- \(spec.displayName) window \(tab.windowIndex) tab \(tab.tabIndex): JavaScript unavailable (\(detail))")
-                if safariJavaScriptBlocked(detail) {
-                    issues.append("  enable: \(spec.kind == "safari" ? safariJavaScriptHint : chromeJavaScriptHint)")
-                }
-
-                guard settings.webUrlFallback, isWebCallURL(tab.url) else { continue }
-                let fallback = CallSession(
-                    key: key,
-                    kind: "web",
-                    title: "WhatsApp",
-                    url: tab.url,
-                    browserName: spec.displayName,
-                    appName: spec.appName,
-                    windowIndex: tab.windowIndex,
-                    tabIndex: tab.tabIndex,
-                    startedAt: Date().timeIntervalSince1970
-                )
-                fallback.detail = "URL fallback: \(tab.title)"
-                sessions.append(fallback)
-                issues.append("  using the in-call URL as a fallback; microphone and camera state unknown")
-                continue
-            }
-
-            recordDetection(for: spec.appName, succeeded: true)
-            guard state.active else { continue }
-
-            let session = CallSession(
-                key: key,
-                kind: "web",
-                title: "WhatsApp",
-                url: tab.url,
-                browserName: spec.displayName,
-                appName: spec.appName,
-                windowIndex: tab.windowIndex,
-                tabIndex: tab.tabIndex,
-                startedAt: Date().timeIntervalSince1970,
-                micMuted: state.micMuted,
-                cameraOn: state.cameraOn
-            )
-            session.detail = state.detail
-            sessions.append(session)
-            issues.append("- \(spec.displayName) window \(tab.windowIndex) tab \(tab.tabIndex): ACTIVE \(state.detail)")
-        }
-    }
-
-    return (sessions, issues)
-}
-
 // MARK: - Test sessions
 
 private func testSession() -> CallSession {
@@ -1692,9 +1173,6 @@ private func testSession() -> CallSession {
         key: "test:whatsapp-call",
         kind: "test",
         title: "WhatsApp",
-        url: nil,
-        browserName: "Test",
-        appName: "WhatsApp Test",
         startedAt: Date().timeIntervalSince1970,
         micMuted: false,
         cameraOn: true
@@ -1706,9 +1184,6 @@ private func diagnosticSession() -> CallSession {
         key: "diagnostic:whatsapp-call",
         kind: "diagnostic",
         title: "WhatsApp",
-        url: nil,
-        browserName: "Plugin running",
-        appName: "WhatsApp Diagnostic",
         startedAt: Date().timeIntervalSince1970,
         micMuted: true,
         cameraOn: false
@@ -1873,22 +1348,10 @@ private final class WhatsAppCallPlugin {
     private var currentSession: CallSession?
     private var published = false
     private var lastSignature: String?
-    /// What is currently hidden, and since when.
-    ///
-    /// A bare key was not enough: after the native call window closes, the
-    /// detection flaps back to a leftover Safari tab sitting on an in-call URL
-    /// and the activity came straight back. `dismissedToken` identifies the call
-    /// that was hidden, `hiddenStatelessToken` records the URL-only tab that was
-    /// on screen at that moment — it has no state that could prove the call
-    /// ended, so it stays hidden until its URL changes.
+    /// Keep a dismissed call hidden until detection sees a quiet gap.
     private var dismissedToken: String?
-    private var dismissedWasStateless = false
-    private var hiddenStatelessToken: String?
     private var dismissedMissingSince: Date?
-    /// Set while a leftover URL-only tab could still turn up after a call ended.
-    private var statelessArmedUntil: Date?
     private var lastSettings: PluginSettings?
-    private var lastIssues = ""
 
     /// Voice activity for the compact waveform.
     private let meter = WaveformMeter()
@@ -1898,7 +1361,6 @@ private final class WhatsAppCallPlugin {
     private var cachedWaveformKey: String?
     private var cachedWaveformPNG: Data?
     private var lastWavePNG: Data?
-    private var lastWaveElapsed = ""
     private var waveTickCount = 0
     private var micPeak: Float = 0
     private var otherPeak: Float = 0
@@ -1929,7 +1391,7 @@ private final class WhatsAppCallPlugin {
                     settings = loadSettings(previous: settings)
                     nextSettingsAt = Date().addingTimeInterval(5)
                 }
-                watcher.update(enabled: settings.detectNativeCalls)
+                watcher.update(enabled: settings.detectNativeCalls, active: currentSession != nil)
                 if settings != lastSettings {
                     if !settings.diagnosticActivity, dismissedToken?.hasPrefix("diagnostic:") == true {
                         forgetDismissal()
@@ -1946,7 +1408,7 @@ private final class WhatsAppCallPlugin {
                 if nextRefreshNeeded || Date() >= nextRefreshAt {
                     nextRefreshNeeded = false
                     try refresh(settings: settings)
-                    nextRefreshAt = Date().addingTimeInterval(monitoringInterval(settings: settings, active: currentSession != nil, appRunning: (settings.detectNativeCalls && whatsappApplication() != nil) || (settings.detectWebCalls && browserSpecs.contains { appIsRunning($0.appName) })))
+                    nextRefreshAt = Date().addingTimeInterval(monitoringInterval(settings: settings, active: currentSession != nil, appRunning: settings.detectNativeCalls && whatsappApplication() != nil))
                 }
 
                 // The waveform is the one thing that must keep moving between
@@ -1957,7 +1419,7 @@ private final class WhatsAppCallPlugin {
                 }
             }
 
-            RunLoop.current.run(until: Date().addingTimeInterval(published ? actionLoopInterval : 0.25))
+            RunLoop.current.run(until: Date().addingTimeInterval(published ? actionLoopInterval : 1.0))
         }
     }
 
@@ -2044,24 +1506,6 @@ private final class WhatsAppCallPlugin {
             debugLog("native \(control) press failed")
         }
 
-        if session.kind == "web",
-           let spec = browserSpecs.first(where: { $0.appName == session.appName }),
-           let windowIndex = session.windowIndex,
-           let tabIndex = session.tabIndex {
-            guard let tab = enumerateWebTabs(spec: spec).first(where: { $0.windowIndex == windowIndex && $0.tabIndex == tabIndex && $0.url == session.url }) else { return false }
-            let script = webJavaScript(webCallToggleJavaScript, control: control)
-            let result = executeWebJavaScript(spec: spec, tab: tab, script: script)
-            if actionSucceeded(result.output) {
-                debugLog("web \(control) succeeded")
-                return true
-            }
-            if safariJavaScriptBlocked(result.detail) {
-                debugLog("web \(control) javascript blocked; enable \(safariJavaScriptHint)")
-            } else {
-                debugLog("web \(control) failed")
-            }
-        }
-
         if ["test", "diagnostic"].contains(session.kind) {
             return true
         }
@@ -2076,11 +1520,6 @@ private final class WhatsAppCallPlugin {
             return true
         }
         return toggle(session: session, control: "end")
-    }
-
-    private func actionSucceeded(_ output: String?) -> Bool {
-        guard let output else { return false }
-        return output.hasPrefix("clicked")
     }
 
     /// Re-resolves a session by key: used after a failed action to decide
@@ -2101,98 +1540,36 @@ private final class WhatsAppCallPlugin {
             return [native]
         }
 
-        guard settings.detectWebCalls else { return [] }
-        let web = webSessions(settings: settings, preferredAppName: currentSession?.appName)
-        let issues = web.issues.joined(separator: "\n")
-        if issues != lastIssues {
-            lastIssues = issues
-            if !issues.isEmpty {
-                debugLog("web detection status changed (\(web.sessions.count) sessions, \(web.issues.count) diagnostic entries)")
-            }
-        }
-        return web.sessions
+        return []
     }
 
-    /// Hides the activity and remembers *what* was hidden, so that a slow
-    /// window close or a leftover fallback tab cannot publish it again.
     private func markDismissed(_ session: CallSession, reason: String) {
-        dismissedToken = sessionToken(session)
-        dismissedWasStateless = isStatelessSession(session)
-        hiddenStatelessToken = nil
+        dismissedToken = session.key
         dismissedMissingSince = nil
-        armLeftoverWatch()
         debugLog("hidden: \(reason) kind=\(session.kind)")
-    }
-
-    /// Starts watching for the URL-only tab a finished call tends to leave
-    /// behind. Bounded, so that a genuine browser call starting later is not
-    /// mistaken for leftovers of this one.
-    private func armLeftoverWatch() {
-        statelessArmedUntil = Date().addingTimeInterval(leftoverWatchSeconds)
     }
 
     private func forgetDismissal() {
         dismissedToken = nil
-        dismissedWasStateless = false
-        hiddenStatelessToken = nil
         dismissedMissingSince = nil
-        statelessArmedUntil = nil
     }
 
-    /// True while this session must stay hidden.
     private func shouldStayHidden(_ session: CallSession) -> Bool {
-        if let missingSince = dismissedMissingSince {
-            let required = dismissedWasStateless || hiddenStatelessToken != nil ? statelessQuietSeconds : quietForgetSeconds
-            if Date().timeIntervalSince(missingSince) >= required { forgetDismissal() }
+        if let missingSince = dismissedMissingSince,
+           Date().timeIntervalSince(missingSince) >= quietForgetSeconds {
+            forgetDismissal()
         }
         dismissedMissingSince = nil
-        let token = sessionToken(session)
-
-        // A tab that only looks like a call because of its URL. While a call is
-        // being hidden, or has just ended, such a tab is that call's leftover —
-        // and it stays hidden until the tab moves on to something else.
-        if isStatelessSession(session) {
-            if let hidden = hiddenStatelessToken {
-                if token == hidden { return true }
-                // The tab now points somewhere else: it may be a real call.
-                hiddenStatelessToken = nil
-                statelessArmedUntil = nil
-                return false
-            }
-            if statelessArmedUntil.map({ Date() < $0 }) == true {
-                hiddenStatelessToken = token
-                debugLog("hiding URL-only leftover")
-                return true
-            }
-            return false
-        }
-
         guard let dismissed = dismissedToken else { return false }
-        guard token == dismissed else {
-            // A different, fully known call: nothing to hide any more.
+        guard session.key == dismissed else {
             forgetDismissal()
             return false
         }
-
-        // Keep the same dismissed call hidden until detection observes a quiet gap.
         return true
     }
 
     private func refresh(settings: PluginSettings) throws {
         let sessions = refreshSession(settings: settings)
-        let previous = currentSession
-
-        // A call whose state we could actually read has just ended. Anything a
-        // URL-only tab claims in the next moments belongs to that call, not to
-        // a new one — this is what kept the activity alive after hanging up.
-        if let previous, !isStatelessSession(previous), statelessArmedUntil == nil {
-            let replaced = sessions.first.map { $0.key != previous.key || isStatelessSession($0) } ?? true
-            if replaced {
-                armLeftoverWatch()
-                debugLog("known call gone; watching for the tab it leaves behind")
-            }
-        }
-
         if let nextSession = sessions.first {
             if let currentSession, currentSession.key == nextSession.key {
                 nextSession.startedAt = currentSession.startedAt
@@ -2205,10 +1582,6 @@ private final class WhatsAppCallPlugin {
             }
 
             currentSession = nextSession
-            if !isStatelessSession(nextSession) {
-                // A real call is on screen again, leftovers no longer apply.
-                statelessArmedUntil = nil
-            }
             if settings.showWaveform, let pid = waveformTargetPID(for: nextSession) {
                 meter.ensureRunning(targetPID: pid, micWanted: nextSession.micMuted == false, tapWanted: settings.captureAppAudio)
             } else {
@@ -2218,15 +1591,9 @@ private final class WhatsAppCallPlugin {
             return
         }
 
-        // No call at all. Forget the hiding once the silence is longer than the
-        // flapping it protects against: one quiet poll for a known call (the
-        // window really closed), a full minute for URL-only detection, which
-        // drops out and comes back every couple of seconds.
-        if dismissedToken != nil || hiddenStatelessToken != nil {
+        if dismissedToken != nil {
             if dismissedMissingSince == nil { dismissedMissingSince = Date() }
-            let gap = Date().timeIntervalSince(dismissedMissingSince ?? Date())
-            let longQuietNeeded = dismissedWasStateless || hiddenStatelessToken != nil
-            if gap >= (longQuietNeeded ? statelessQuietSeconds : quietForgetSeconds) {
+            if Date().timeIntervalSince(dismissedMissingSince ?? Date()) >= quietForgetSeconds {
                 forgetDismissal()
             }
         } else {
@@ -2239,7 +1606,6 @@ private final class WhatsAppCallPlugin {
         let signature = [
             session.key,
             session.title,
-            session.browserName,
             session.detail,
             session.micMuted.map(String.init) ?? "unknown",
             session.cameraOn.map(String.init) ?? "unknown",
@@ -2262,7 +1628,6 @@ private final class WhatsAppCallPlugin {
         lastSignature = signature
         // The tick keeps its own record of what is already on screen.
         lastWavePNG = waveform
-        lastWaveElapsed = formatElapsed(Date().timeIntervalSince1970 - session.startedAt)
     }
 
     private func dismiss() throws {
@@ -2276,7 +1641,6 @@ private final class WhatsAppCallPlugin {
         meter.stop()
         resetWaveHistory()
         lastWavePNG = nil
-        lastWaveElapsed = ""
     }
 
     // MARK: Waveform
@@ -2288,16 +1652,10 @@ private final class WhatsAppCallPlugin {
         session.micMuted = true
         session.cameraOn = false
         guard plugin.shouldStayHidden(session) else { return false }
-        let next = CallSession(key: "next", kind: "native", title: "WhatsApp", url: nil, browserName: "WhatsApp", appName: "WhatsApp", startedAt: 0, micMuted: false, cameraOn: false)
+        let next = CallSession(key: "next", kind: "native", title: "WhatsApp", startedAt: 0, micMuted: false, cameraOn: false)
         guard !plugin.shouldStayHidden(next) else { return false }
-        let fallback = CallSession(key: "web:1", kind: "web", title: "WhatsApp", url: "https://web.whatsapp.com/call/1", browserName: "Test", appName: "Test", startedAt: 0)
-        plugin.armLeftoverWatch()
-        guard plugin.shouldStayHidden(fallback) else { return false }
-        fallback.micMuted = false
-        guard !plugin.shouldStayHidden(fallback) else { return false }
         next.micMuted = nil
         next.cameraOn = nil
-        guard !isStatelessSession(next) else { return false }
         plugin.markDismissed(next, reason: "self-test")
         plugin.dismissedMissingSince = Date().addingTimeInterval(-4)
         return !plugin.shouldStayHidden(next)
@@ -2309,6 +1667,9 @@ private final class WhatsAppCallPlugin {
     }
 
     private func resetWaveHistory() {
+        micPeak = 0
+        otherPeak = 0
+        micRecent.removeAll(keepingCapacity: true)
         cachedWaveformKey = nil
         cachedWaveformPNG = nil
         youHistory = Array(repeating: 0, count: waveformBarsPerSide)
@@ -2326,16 +1687,9 @@ private final class WhatsAppCallPlugin {
     }
 
     /// One frame: append the newest levels, redraw, and send the compact
-    /// surface only when the bars or the duration actually changed — a silent
-    /// call then costs one frame per second instead of eight.
+    /// surface only when the bars changed. Steady silence emits no frames.
     private func waveformTick(session: CallSession, settings: PluginSettings) throws {
-        if !settings.showWaveform {
-            let elapsed = formatElapsed(Date().timeIntervalSince1970 - session.startedAt)
-            guard elapsed != lastWaveElapsed else { return }
-            try client.send(compactUpdatePayload(session: session, waveform: nil, showWaveform: false))
-            lastWaveElapsed = elapsed
-            return
-        }
+        guard settings.showWaveform else { return }
         let snapshot = meter.snapshot
 
         padHistories()
@@ -2357,7 +1711,7 @@ private final class WhatsAppCallPlugin {
             themHistory.append(scaledLevel(snapshot.other, peak: otherPeak))
 
             waveDiagCount += 1
-            if waveDiagCount % 8 == 1 {
+            if verboseAudioDiagnostics && waveDiagCount % 8 == 1 {
                 debugLog(String(
                     format: "waveform: mic=%.5f (%.1f dB) peak=%.5f (%.1f dB) bar=%.2f frames=%d tap=%.5f stale=%d",
                     micSmoothed, 20 * log10(max(Double(micSmoothed), 1e-6)),
@@ -2369,11 +1723,9 @@ private final class WhatsAppCallPlugin {
         themHistory.removeFirst(max(0, themHistory.count - waveformBarsPerSide))
 
         let waveform = waveformPNG(muted: !["test", "diagnostic"].contains(session.kind) && session.micMuted != false, enabled: settings.showWaveform, includeOther: settings.captureAppAudio || ["test", "diagnostic"].contains(session.kind))
-        let elapsed = formatElapsed(Date().timeIntervalSince1970 - session.startedAt)
-        guard waveform != lastWavePNG || elapsed != lastWaveElapsed else { return }
+        guard waveform != lastWavePNG else { return }
 
         lastWavePNG = waveform
-        lastWaveElapsed = elapsed
         try client.send(compactUpdatePayload(
             session: session,
             waveform: waveform,
@@ -2402,6 +1754,7 @@ private final class NativeWatcher {
     private var tokens: [NSObjectProtocol] = []
     private var nextAttachAt = Date.distantPast
     private var lastEventAt = Date.distantPast
+    private var active = false
     private let changed: () -> Void
 
     init(changed: @escaping () -> Void) {
@@ -2427,10 +1780,11 @@ private final class NativeWatcher {
         pid = 0
     }
 
-    func update(enabled: Bool) {
+    func update(enabled: Bool, active: Bool) {
+        self.active = active
         guard enabled else { detach(); return }
         guard Date() >= nextAttachAt else { return }
-        nextAttachAt = Date().addingTimeInterval(5)
+        nextAttachAt = Date().addingTimeInterval(pid == 0 ? 15 : 5)
         let nextPID = whatsappApplication()?.processIdentifier ?? 0
         if nextPID == pid, observer != nil { return }
         detach()
@@ -2439,7 +1793,7 @@ private final class NativeWatcher {
         guard AXObserverCreate(nextPID, { _, _, _, context in
             guard let context else { return }
             let watcher = Unmanaged<NativeWatcher>.fromOpaque(context).takeUnretainedValue()
-            if Date().timeIntervalSince(watcher.lastEventAt) > 0.2 {
+            if Date().timeIntervalSince(watcher.lastEventAt) > (watcher.active ? 0.2 : 0.75) {
                 watcher.lastEventAt = Date()
                 watcher.changed()
             }
@@ -2467,26 +1821,23 @@ private func runSelfTest() -> Int32 {
     check(!PluginSettings().captureAppAudio, "system audio capture opt-in")
     check(scaledLevel(0, peak: 0.1) == 0 && scaledLevel(0.1, peak: 0.1) == 1, "audio amplitude drives waveform")
     let midBar = scaledLevel(0.05, peak: 0.1)
-    check(midBar > 0.45 && midBar < 0.55, "six dB below the loudest moment is mid-bar")
-    check(updatedPeak(0.01, 0.2) == 0.2 && updatedPeak(0.2, 0.01) < 0.2, "peak attack and slow release")
+    check(midBar > 0.8, "normal speech has a strong bar")
+    check(scaledLevel(0.0005, peak: 0.002) > 0.55, "quiet low-gain speech stays visible")
+    check(scaledLevel(0.00005, peak: 0.002) == 0, "silence stays flat")
+    check(scaledLevel(0.002, peak: 0.1) > 0.15, "quiet speech remains visible after a loud word")
+    check(abs(updatedPeak(0.01, 0.2) - 0.04) < 0.00001 && updatedPeak(0.2, 0.01) < 0.2, "peak attack and slow release")
     check(doubleValue("nan", default: 1, minimum: 0.5, maximum: 5) == 1, "non-finite setting")
     check(doubleValue(99, default: 1, minimum: 0.5, maximum: 5) == 5, "setting clamp")
-    check(isWebCallURL("https://web.whatsapp.com/call/123"), "call URL")
-    for url in ["https://evil.test/web.whatsapp.com/call/123", "https://web.whatsapp.com.evil.test/call/123", "http://web.whatsapp.com/call/123", "https://web.whatsapp.com/"] {
-        check(!isWebCallURL(url), "reject unrelated URL")
-    }
     let settings = PluginSettings()
     check(monitoringInterval(settings: settings, active: false, appRunning: false) == 15, "closed cadence")
     check(monitoringInterval(settings: settings, active: false, appRunning: true) == 3, "idle cadence")
     check(monitoringInterval(settings: settings, active: true, appRunning: true) == 1, "active cadence")
-    check(parseWebState("1|muted|off|test")?.micMuted == true, "web parsing")
-    check(parseWebState("garbage") == nil, "malformed web state")
     if let png = renderWaveformPNG(you: Array(repeating: 1, count: 7), them: Array(repeating: 1, count: 7), youMuted: false),
        let bitmap = NSBitmapImageRep(data: png),
        let yours = bitmap.colorAt(x: 4, y: 28)?.usingColorSpace(.deviceRGB),
        let theirs = bitmap.colorAt(x: 196, y: 28)?.usingColorSpace(.deviceRGB) {
-        check(yours.greenComponent > yours.redComponent, "your microphone green on the left")
-        check(theirs.redComponent > theirs.greenComponent, "far end orange on the right")
+        check(yours.redComponent > yours.greenComponent, "your microphone orange on the left")
+        check(theirs.greenComponent > theirs.redComponent, "far end green on the right")
     } else { check(false, "waveform rendered color samples") }
 
     // The compact surface: the tilted phone symbol owns the left slot, the
@@ -2542,7 +1893,6 @@ private func runCheck() -> Int32 {
     print("Control labels: \(labelSource)")
     print("Accessibility trusted: \(yesNo(AXIsProcessTrusted()))")
     print("WhatsApp running: \(yesNo(whatsappApplication() != nil))")
-    print("osascript: \(FileManager.default.fileExists(atPath: "/usr/bin/osascript") ? "ok" : "missing")")
 
     switch AVCaptureDevice.authorizationStatus(for: .audio) {
     case .authorized:
@@ -2582,56 +1932,6 @@ private func runCheck() -> Int32 {
         print("Native call: detection disabled in settings")
     }
 
-    if !settings.detectWebCalls {
-        print("Web calls: detection disabled in settings")
-        print("JavaScript from Apple Events needed for web controls:")
-        print("  \(safariJavaScriptHint)")
-        print("  \(chromeJavaScriptHint)")
-        return 0
-    }
-
-    let runningBrowsers = browserSpecs.filter { appIsRunning($0.appName) }
-    print("Browsers: \(runningBrowsers.isEmpty ? "none running" : runningBrowsers.map(\.displayName).joined(separator: ", "))")
-    print("JavaScript from Apple Events needed for web controls:")
-    print("  \(safariJavaScriptHint)")
-    print("  \(chromeJavaScriptHint)")
-
-    var found = false
-    for spec in runningBrowsers {
-        guard detectionAllowed(for: spec.appName) else {
-            print("- \(spec.displayName): backing off after earlier failures")
-            continue
-        }
-
-        let tabs = enumerateWebTabs(spec: spec)
-        if tabs.isEmpty {
-            print("- \(spec.displayName): no web.whatsapp.com tabs")
-            continue
-        }
-
-        for tab in tabs {
-            let result = executeWebJavaScript(spec: spec, tab: tab, script: stateJavaScript())
-            found = true
-            print("- \(spec.displayName) window \(tab.windowIndex) tab \(tab.tabIndex): \(tab.url)")
-            if let output = result.output, let state = parseWebState(output) {
-                print("    call: \(state.active ? "ACTIVE" : "not active")")
-                print("    microphone: \(state.micMuted == true ? "muted" : state.micMuted == false ? "live" : "unknown")")
-                print("    camera: \(state.cameraOn == true ? "on" : state.cameraOn == false ? "off" : "unknown")")
-                print("    controls: \(state.detail)")
-            } else {
-                print("    JavaScript unavailable (\(result.detail ?? "no result"))")
-                if isWebCallURL(tab.url) {
-                    print(settings.webUrlFallback
-                        ? "    fallback: in-call URL detected, so the activity would show with unknown states"
-                        : "    fallback: in-call URL detected, but \"Fallback Without JavaScript\" is disabled in settings")
-                }
-            }
-        }
-    }
-
-    if !found {
-        print("Web sessions: none detected")
-    }
     return 0
 }
 
@@ -2641,9 +1941,6 @@ private func runDemoJSON() -> Int32 {
         key: "native",
         kind: "native",
         title: "WhatsApp",
-        url: nil,
-        browserName: "WhatsApp",
-        appName: "WhatsApp",
         startedAt: now - 44,
         micMuted: false,
         cameraOn: true
