@@ -1,3 +1,4 @@
+// WhatsApp Call integration by Benteltje and Rafael Reverberi.
 import AppKit
 import ApplicationServices
 import AudioToolbox
@@ -17,7 +18,6 @@ private let settingsPathEnvironmentKey = "DYNAMICLAKE_PLUGIN_SETTINGS_PATH"
 private let testSessionEnvironmentKey = "DYNAMICLAKE_WHATSAPP_CALL_TEST_SESSION"
 private let maxFrameSize = 64 * 1024
 private let timerMaximumDuration: TimeInterval = 48 * 60 * 60
-private let actionLoopInterval: TimeInterval = 0.05
 private let verboseAudioDiagnostics = ProcessInfo.processInfo.environment["DYNAMICLAKE_WHATSAPP_DEBUG"] == "1"
 
 /// Cadence of the waveform animation: fast enough to read as movement, slow
@@ -155,6 +155,7 @@ private enum PluginError: Error, CustomStringConvertible {
 private final class JSONSocketClient {
     let socketPath: String
     private var fileDescriptor: Int32 = -1
+    var readinessDescriptor: Int32 { fileDescriptor }
     private var readBuffer = Data()
 
     init(socketPath: String) {
@@ -1377,19 +1378,25 @@ private final class WhatsAppCallPlugin {
         debugLog("connected")
 
         defer { meter.stop(); client.close() }
-        let watcher = NativeWatcher { [weak self] in self?.nextRefreshNeeded = true }
+        let watcher = NativeWatcher { [weak self] in
+            self?.nextRefreshNeeded = true
+            CFRunLoopStop(CFRunLoopGetCurrent())
+        }
+        let wakeups = RuntimeWakeups(socketDescriptor: client.readinessDescriptor)
+        defer { wakeups.close() }
         var nextRefreshAt = Date.distantPast
         var settings = loadSettings()
-        var nextSettingsAt = Date().addingTimeInterval(5)
+        var nextSettingsAt = Date().addingTimeInterval(60)
 
         while true {
-            // Everything Foundation and CoreAudio hands back autoreleased, and
-            // there is no run loop here to drain a pool: without this the
-            // process grows for as long as it runs.
+            // Drain Foundation/CoreAudio autoreleased objects each iteration,
+            // including during long-lived calls.
             try autoreleasepool {
-                if Date() >= nextSettingsAt {
+                if wakeups.settingsChanged || Date() >= nextSettingsAt {
+                    wakeups.settingsChanged = false
                     settings = loadSettings(previous: settings)
-                    nextSettingsAt = Date().addingTimeInterval(5)
+                    wakeups.observeSettingsFile()
+                    nextSettingsAt = Date().addingTimeInterval(60)
                 }
                 watcher.update(enabled: settings.detectNativeCalls, active: currentSession != nil)
                 if settings != lastSettings {
@@ -1408,7 +1415,8 @@ private final class WhatsAppCallPlugin {
                 if nextRefreshNeeded || Date() >= nextRefreshAt {
                     nextRefreshNeeded = false
                     try refresh(settings: settings)
-                    nextRefreshAt = Date().addingTimeInterval(monitoringInterval(settings: settings, active: currentSession != nil, appRunning: settings.detectNativeCalls && whatsappApplication() != nil))
+                    nextRefreshAt = Date().addingTimeInterval(monitoringInterval(settings: settings, active: currentSession != nil, appRunning: settings.detectNativeCalls && whatsappApplication() != nil, windowEventsAvailable: watcher.windowEventsAvailable))
+                    watcher.observeWindows()
                 }
 
                 // The waveform is the one thing that must keep moving between
@@ -1419,7 +1427,12 @@ private final class WhatsAppCallPlugin {
                 }
             }
 
-            RunLoop.current.run(until: Date().addingTimeInterval(published ? actionLoopInterval : 1.0))
+            // Socket/file/AX events stop the run loop immediately. No periodic
+            // one-second socket check is needed while there is no call.
+            wakeups.armSocket()
+            let deadline = min(nextRefreshAt, nextSettingsAt, watcher.nextMaintenanceAt)
+            let waitUntil = published && settings.showWaveform ? min(deadline, nextWaveAt) : deadline
+            CFRunLoopRunInMode(CFRunLoopMode.defaultMode, max(0.01, waitUntil.timeIntervalSinceNow), true)
         }
     }
 
@@ -1741,27 +1754,105 @@ private final class WhatsAppCallPlugin {
 
 // MARK: - Adaptive monitoring
 
-private func monitoringInterval(settings: PluginSettings, active: Bool, appRunning: Bool) -> TimeInterval {
+/// OS readiness sources let the main loop sleep until actual work arrives.
+private final class RuntimeWakeups {
+    private var socket: CFFileDescriptor?
+    private var socketSource: CFRunLoopSource?
+    private var settingsSource: DispatchSourceFileSystemObject?
+    private var settingsFileSource: DispatchSourceFileSystemObject?
+    var settingsChanged = false
+
+    init(socketDescriptor: Int32) {
+        socket = CFFileDescriptorCreate(nil, socketDescriptor, false, { _, _, _ in
+            CFRunLoopStop(CFRunLoopGetCurrent())
+        }, nil)
+        if let socket {
+            socketSource = CFFileDescriptorCreateRunLoopSource(nil, socket, 0)
+            if let socketSource { CFRunLoopAddSource(CFRunLoopGetCurrent(), socketSource, .defaultMode) }
+        }
+        // Observe the directory so atomic settings-file replacement also wakes us.
+        if let path = ProcessInfo.processInfo.environment[settingsPathEnvironmentKey] {
+            let parent = URL(fileURLWithPath: path).deletingLastPathComponent().path
+            let fd = Darwin.open(parent, O_EVTONLY | O_CLOEXEC)
+            if fd >= 0 {
+                let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+                source.setEventHandler { [weak self] in
+                    self?.settingsChanged = true
+                    CFRunLoopStop(CFRunLoopGetMain())
+                }
+                source.setCancelHandler { Darwin.close(fd) }
+                source.resume()
+                settingsSource = source
+            }
+        }
+        observeSettingsFile()
+    }
+
+    func observeSettingsFile() {
+        settingsFileSource?.cancel()
+        settingsFileSource = nil
+        guard let path = ProcessInfo.processInfo.environment[settingsPathEnvironmentKey] else { return }
+        let fd = Darwin.open(path, O_EVTONLY | O_CLOEXEC)
+        guard fd >= 0 else { return }
+        // In-place writes do not change the parent directory. Keep a file
+        // watcher too, reopening it after replacement or the recovery check.
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.settingsChanged = true
+            CFRunLoopStop(CFRunLoopGetMain())
+        }
+        source.setCancelHandler { Darwin.close(fd) }
+        source.resume()
+        settingsFileSource = source
+    }
+
+    func armSocket() {
+        if let socket { CFFileDescriptorEnableCallBacks(socket, CFOptionFlags(kCFFileDescriptorReadCallBack)) }
+    }
+
+    func close() {
+        if let socketSource { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), socketSource, .defaultMode) }
+        if let socket { CFFileDescriptorInvalidate(socket) }
+        socketSource = nil
+        socket = nil
+        settingsSource?.cancel()
+        settingsSource = nil
+        settingsFileSource?.cancel()
+        settingsFileSource = nil
+    }
+
+    deinit { close() }
+}
+
+private func monitoringInterval(settings: PluginSettings, active: Bool, appRunning: Bool, windowEventsAvailable: Bool = true) -> TimeInterval {
     if active || settings.diagnosticActivity || ProcessInfo.processInfo.environment[testSessionEnvironmentKey] == "1" { return settings.pollSeconds }
-    return appRunning ? 3 : 15
+    return appRunning ? (windowEventsAvailable ? 60 : 15) : 300
 }
 
 /// All callbacks run on the same run loop as detection. Bursts become one refresh.
 private final class NativeWatcher {
     private var observer: AXObserver?
     private var application: AXUIElement?
+    private var windows: [AXUIElement] = []
     private var pid: pid_t = 0
     private var tokens: [NSObjectProtocol] = []
     private var nextAttachAt = Date.distantPast
+    var nextMaintenanceAt: Date { nextAttachAt }
+    private(set) var windowEventsAvailable = false
     private var lastEventAt = Date.distantPast
     private var active = false
     private let changed: () -> Void
+    private let windowNotifications = [kAXUIElementDestroyedNotification, kAXLayoutChangedNotification, kAXValueChangedNotification, kAXTitleChangedNotification]
 
     init(changed: @escaping () -> Void) {
         self.changed = changed
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification, NSWorkspace.didWakeNotification] {
-            tokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+            tokens.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                if notification.name != NSWorkspace.didWakeNotification {
+                    guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                          app.bundleIdentifier == whatsappBundleIdentifier else { return }
+                }
                 self?.nextAttachAt = .distantPast
                 self?.changed()
             })
@@ -1777,14 +1868,20 @@ private final class NativeWatcher {
         if let observer { CFRunLoopRemoveSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(observer), .defaultMode) }
         observer = nil
         application = nil
+        windows = []
         pid = 0
+        windowEventsAvailable = false
     }
 
     func update(enabled: Bool, active: Bool) {
         self.active = active
-        guard enabled else { detach(); return }
+        guard enabled else {
+            detach()
+            nextAttachAt = Date().addingTimeInterval(300)
+            return
+        }
         guard Date() >= nextAttachAt else { return }
-        nextAttachAt = Date().addingTimeInterval(pid == 0 ? 15 : 5)
+        nextAttachAt = Date().addingTimeInterval(60)
         let nextPID = whatsappApplication()?.processIdentifier ?? 0
         if nextPID == pid, observer != nil { return }
         detach()
@@ -1801,13 +1898,35 @@ private final class NativeWatcher {
         let app = AXUIElementCreateApplication(nextPID)
         AXUIElementSetMessagingTimeout(app, axMessagingTimeout)
         let context = Unmanaged.passUnretained(self).toOpaque()
-        for notification in [kAXWindowCreatedNotification, kAXUIElementDestroyedNotification, kAXLayoutChangedNotification, kAXValueChangedNotification, kAXTitleChangedNotification] {
+        windowEventsAvailable = AXObserverAddNotification(created, app, kAXWindowCreatedNotification as CFString, context) == .success
+        for notification in windowNotifications + [kAXFocusedWindowChangedNotification, kAXMainWindowChangedNotification] {
             _ = AXObserverAddNotification(created, app, notification as CFString, context)
         }
         observer = created
         application = app
         pid = nextPID
         CFRunLoopAddSource(CFRunLoopGetCurrent(), AXObserverGetRunLoopSource(created), .defaultMode)
+        observeWindows()
+    }
+
+    func observeWindows() {
+        guard let observer, let application,
+              let current = axAttribute(application, kAXWindowsAttribute) as? [AXUIElement] else { return }
+        // Register on the actual windows as well: some notifications are not
+        // delivered when registered only on the application element.
+        for window in windows where !current.contains(where: { CFEqual($0, window) }) {
+            for notification in windowNotifications {
+                _ = AXObserverRemoveNotification(observer, window, notification as CFString)
+            }
+        }
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        for window in current where !windows.contains(where: { CFEqual($0, window) }) {
+            AXUIElementSetMessagingTimeout(window, axMessagingTimeout)
+            for notification in windowNotifications {
+                _ = AXObserverAddNotification(observer, window, notification as CFString, context)
+            }
+        }
+        windows = current
     }
 }
 
@@ -1829,8 +1948,9 @@ private func runSelfTest() -> Int32 {
     check(doubleValue("nan", default: 1, minimum: 0.5, maximum: 5) == 1, "non-finite setting")
     check(doubleValue(99, default: 1, minimum: 0.5, maximum: 5) == 5, "setting clamp")
     let settings = PluginSettings()
-    check(monitoringInterval(settings: settings, active: false, appRunning: false) == 15, "closed cadence")
-    check(monitoringInterval(settings: settings, active: false, appRunning: true) == 3, "idle cadence")
+    check(monitoringInterval(settings: settings, active: false, appRunning: false) == 300, "closed cadence")
+    check(monitoringInterval(settings: settings, active: false, appRunning: true) == 60, "idle cadence")
+    check(monitoringInterval(settings: settings, active: false, appRunning: true, windowEventsAvailable: false) == 15, "unsupported AX fallback cadence")
     check(monitoringInterval(settings: settings, active: true, appRunning: true) == 1, "active cadence")
     if let png = renderWaveformPNG(you: Array(repeating: 1, count: 7), them: Array(repeating: 1, count: 7), youMuted: false),
        let bitmap = NSBitmapImageRep(data: png),

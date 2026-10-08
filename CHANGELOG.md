@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.9
+
+- Credit Rafael Reverberi alongside Benteltje in the manifest, source and package documentation.
+- Replace periodic idle socket checks with OS readiness callbacks; host actions and disconnects wake the monitor immediately.
+- Reload settings through file and directory watchers, including atomic file replacement, with a once-per-minute recovery check.
+- Register Accessibility events on WhatsApp windows and ignore unrelated app lifecycle events.
+- Reduce idle call detection to once per minute with window-created events (15 seconds when unsupported), and closed-app checks to once per five minutes. Keep active-call refresh and waveform behavior.
+
 ## 1.2.8
 
 - Focus detection and call controls exclusively on the native WhatsApp macOS app.

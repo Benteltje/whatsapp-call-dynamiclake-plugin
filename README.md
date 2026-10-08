@@ -6,6 +6,10 @@ Shows a detected WhatsApp call in the macOS notch: a tilted green `phone.fill` S
 
 An independent community integration. WhatsApp's Accessibility interface can change; detection and control availability depend on the installed macOS app and permissions.
 
+## Authors
+
+Developed by Benteltje with contributions by **Rafael Reverberi**.
+
 ## Requirements
 
 - macOS 14.2 or later, Apple Silicon or Intel
@@ -27,7 +31,7 @@ Outputs:
 - `build/WhatsAppCall.dynamiclakeplugin/` — installable package with universal executable
 - `WhatsAppCall.dynamiclakeplugin/` — latest complete installable package in the repository root
 - `WhatsAppCall.dynamiclakeplugin.zip` and `.sha256` — stable root download refreshed by every build
-- `dist/WhatsAppCall-1.2.8.dynamiclakeplugin.zip` — versioned release archive
+- `dist/WhatsAppCall-1.2.9.dynamiclakeplugin.zip` — versioned release archive
 - Matching `.sha256` checksum
 
 The root package, stable ZIP and checksum are committed so GitHub users can download without building. Intermediate `build/` and `dist/` output remains ignored. The package contains only runtime files and documentation. Older release archives are preserved when rebuilding.
@@ -61,9 +65,11 @@ Real audio levels require the applicable macOS microphone/system-audio authoriza
 
 ## Efficiency and reliability
 
-Workspace launch, quit and wake notifications trigger detection; native Accessibility window/value/layout notifications provide additional refreshes when WhatsApp supports them. Event bursts are coalesced. Fallback detection runs every 3 seconds while WhatsApp is idle and every 15 seconds when closed; an active call uses the selected refresh rate.
+WhatsApp launch, quit and system wake notifications trigger detection; unrelated app launches do not. Accessibility notifications are registered on both WhatsApp and its actual windows, with event bursts coalesced. Without a call, fallback detection runs every 60 seconds if WhatsApp accepts window-created notifications, or every 15 seconds if it does not. When WhatsApp is closed, detection runs only every 5 minutes as a safety check. An active call keeps the selected refresh rate.
 
-Settings are read at most once every 5 seconds. The run loop services events between checks, with one socket check per second while idle. Observer attachment retries slow to 15 seconds when WhatsApp is absent; idle AX events are coalesced over 0.75 seconds. AX tree reads have a node budget, an overall traversal deadline and per-message timeouts. Unsupported observer notifications fall back to polling.
+The plugin sleeps on native run-loop sources instead of checking the socket every second. Incoming host actions and disconnects wake it immediately. File and directory watchers reload settings on in-place writes and atomic replacement, with a 60-second recovery check. Observer maintenance runs at most once per minute, or immediately after WhatsApp launch/quit or system wake. AX tree reads retain their node budget, overall traversal deadline and per-message timeouts.
+
+This is an event-driven macOS integration: WhatsApp does not need to connect to the plugin. The plugin subscribes to OS notifications exposed by the app. Because notification support and delivery depend on WhatsApp, occasional fallback checks remain necessary; this is not a guaranteed direct call-event API.
 
 Meters close when hidden, disabled or ended. The microphone is released when mute state is unknown or muted, or its permission is unavailable. Quiet speech uses a compressed gain curve with a −80 dBFS silence gate and faster recovery after loud words. Calibration resets after every call. Waveform updates affect only the compact surface and skip unchanged frames even as elapsed time passes, reusing unchanged waveform images. A setting change also updates the full activity.
 

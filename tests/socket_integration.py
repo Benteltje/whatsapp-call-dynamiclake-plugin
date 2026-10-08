@@ -17,6 +17,7 @@ root = Path(__file__).resolve().parents[1]
 manifest = json.loads((root / 'plugin.json').read_text())
 package = binary.parent
 assert manifest['executable'] == binary.name
+assert 'Rafael Reverberi' in manifest['developerName']
 assert {s['id'] for s in manifest['settings']} == {'pollSeconds', 'detectNativeCalls', 'diagnosticActivity', 'showWaveform', 'captureAppAudio'}
 assert (package / manifest['icon']).is_file()
 architectures = subprocess.check_output(['lipo', '-archs', str(binary)], text=True).split()
@@ -142,6 +143,60 @@ with tempfile.TemporaryDirectory(prefix='wa-test-', dir='/tmp') as directory:
         if process.poll() is None:
             process.terminate(); process.wait(timeout=3)
 
+# A dormant monitor must wake on atomic settings replacement and socket EOF,
+# without waiting for the 60-second settings or 300-second detection fallback.
+with tempfile.TemporaryDirectory(prefix='wa-idle-', dir='/tmp') as directory:
+    directory = Path(directory)
+    settings = directory / 'settings.json'
+    settings.write_text(json.dumps({'detectNativeCalls': False, 'showWaveform': False}))
+    listener = socket.socket(socket.AF_UNIX)
+    path = str(directory / 'socket')
+    listener.bind(path); listener.listen(1); listener.settimeout(5)
+    env.update(DYNAMICLAKE_JSON_SOCKET=path, DYNAMICLAKE_PLUGIN_SETTINGS_PATH=str(settings))
+    process = subprocess.Popen([str(binary)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    conn = None
+    try:
+        conn, _ = listener.accept()
+        conn.settimeout(2)
+        try:
+            conn.recv(1)
+            raise AssertionError('idle plugin emitted data')
+        except socket.timeout:
+            pass
+        def idle_frame():
+            header = b''
+            while len(header) < 4:
+                part = conn.recv(4 - len(header))
+                assert part
+                header += part
+            length = struct.unpack('!I', header)[0]
+            body = b''
+            while len(body) < length:
+                part = conn.recv(length - len(body))
+                assert part
+                body += part
+            return json.loads(body)
+        def replace_idle_settings(diagnostic):
+            temporary = settings.with_suffix('.tmp')
+            temporary.write_text(json.dumps({'detectNativeCalls': False, 'showWaveform': False, 'diagnosticActivity': diagnostic}))
+            temporary.replace(settings)
+        started = time.monotonic()
+        replace_idle_settings(True)
+        assert idle_frame()['type'] == 'create'
+        assert time.monotonic() - started < 2, 'settings must wake dormant plugin immediately'
+        # Test an in-place write too; directory-only watching misses this.
+        time.sleep(0.2)
+        settings.write_text(json.dumps({'detectNativeCalls': False, 'showWaveform': False, 'diagnosticActivity': False}))
+        assert idle_frame()['type'] == 'dismiss'
+        time.sleep(0.2)
+        conn.close(); conn = None
+        assert process.wait(timeout=2) == 65, 'idle disconnect must wake monitor immediately'
+        assert b'host disconnected' in process.stderr.read()
+    finally:
+        if conn: conn.close()
+        listener.close()
+        if process.poll() is None: process.kill(); process.wait()
+
 # Hostile frame lengths must terminate promptly instead of allocating indefinitely.
 with tempfile.TemporaryDirectory(prefix='wa-bad-', dir='/tmp') as directory:
     listener = socket.socket(socket.AF_UNIX)
@@ -160,4 +215,4 @@ with tempfile.TemporaryDirectory(prefix='wa-bad-', dir='/tmp') as directory:
     finally:
         listener.close()
         if process.poll() is None: process.kill(); process.wait()
-print('Package, payload, fragmented socket actions, settings reload, dismissal, preview restart, hangup, disconnect and oversized-frame tests passed.')
+print('Package, payload, fragmented socket actions, settings reload, dismissal, preview restart, hangup, dormant settings/disconnect wakeups and oversized-frame tests passed.')
