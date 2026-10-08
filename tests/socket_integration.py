@@ -18,7 +18,7 @@ manifest = json.loads((root / 'plugin.json').read_text())
 package = binary.parent
 assert manifest['executable'] == binary.name
 assert 'Rafael Reverberi' in manifest['developerName']
-assert {s['id'] for s in manifest['settings']} == {'pollSeconds', 'detectNativeCalls', 'diagnosticActivity', 'showWaveform', 'captureAppAudio'}
+assert {s['id'] for s in manifest['settings']} == {'pollSeconds', 'detectNativeCalls', 'diagnosticActivity', 'showWaveform', 'captureAppAudio', 'microphoneSensitivity'}
 assert (package / manifest['icon']).is_file()
 architectures = subprocess.check_output(['lipo', '-archs', str(binary)], text=True).split()
 assert set(architectures) == {'arm64', 'x86_64'}
@@ -101,6 +101,8 @@ with tempfile.TemporaryDirectory(prefix='wa-test-', dir='/tmp') as directory:
         first_image = initial['surfaces']['compactLiveActivity']['rightSlot']['base64Data']
         until(lambda f: f.get('surfaces', {}).get('compactLiveActivity', {}).get('rightSlot', {}).get('base64Data') not in [None, first_image])
         send({'type':'response', 'ok':True})
+        save(microphoneSensitivity=1.25)
+        until(lambda f: 'sneakPeek' in f.get('surfaces', {}) and f['type'] == 'update')
         save(captureAppAudio=True)
         wave = until(lambda f: 'sneakPeek' in f.get('surfaces', {}) and f['type'] == 'update')
         image = wave['surfaces']['compactLiveActivity']['rightSlot']

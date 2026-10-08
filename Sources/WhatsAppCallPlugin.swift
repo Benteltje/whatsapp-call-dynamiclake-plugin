@@ -52,9 +52,10 @@ private struct PluginSettings: Equatable, CustomStringConvertible {
     var diagnosticActivity = false
     var showWaveform = true
     var captureAppAudio = false
+    var microphoneSensitivity: Double = 0.9
 
     var description: String {
-        "PluginSettings(pollSeconds: \(pollSeconds), detectNativeCalls: \(detectNativeCalls), diagnosticActivity: \(diagnosticActivity), showWaveform: \(showWaveform), captureAppAudio: \(captureAppAudio))"
+        "PluginSettings(pollSeconds: \(pollSeconds), detectNativeCalls: \(detectNativeCalls), diagnosticActivity: \(diagnosticActivity), showWaveform: \(showWaveform), captureAppAudio: \(captureAppAudio), microphoneSensitivity: \(microphoneSensitivity))"
     }
 }
 
@@ -124,7 +125,8 @@ private func loadSettings(previous: PluginSettings? = nil) -> PluginSettings {
         detectNativeCalls: boolValue(settingValue(values, id: "detectNativeCalls", default: true), default: true),
         diagnosticActivity: boolValue(settingValue(values, id: "diagnosticActivity", default: false), default: false),
         showWaveform: boolValue(settingValue(values, id: "showWaveform", default: true), default: true),
-        captureAppAudio: boolValue(settingValue(values, id: "captureAppAudio", default: false), default: false)
+        captureAppAudio: boolValue(settingValue(values, id: "captureAppAudio", default: false), default: false),
+        microphoneSensitivity: doubleValue(settingValue(values, id: "microphoneSensitivity", default: 0.9), default: 0.9, minimum: 0.5, maximum: 1.5)
     )
 }
 
@@ -558,6 +560,124 @@ private func defaultOutputDeviceUID() -> String? {
     return audioObjectString(device, selector: kAudioDevicePropertyDeviceUID)
 }
 
+/// CoreAudio's voice-activity state uses echo-cancelled input without routing
+/// audio through our own voice-processing engine (which could duck WhatsApp).
+/// State changes arrive on the main queue; no waveform-time property polling.
+private final class LocalSpeechDetector {
+    private var active = false
+    private var device: AudioObjectID = 0
+    private var enabledByUs = false
+    private var voiceListener: AudioObjectPropertyListenerBlock?
+    private var deviceListener: AudioObjectPropertyListenerBlock?
+    private(set) var speechDetected: Bool?
+
+    private var enableAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVoiceActivityDetectionEnable,
+            mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+    }
+    private var stateAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVoiceActivityDetectionState,
+            mScope: kAudioDevicePropertyScopeInput, mElement: kAudioObjectPropertyElementMain)
+    }
+    private var defaultAddress: AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal, mElement: kAudioObjectPropertyElementMain)
+    }
+
+    func start() {
+        guard !active else { return }
+        active = true
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self, self.active else { return }
+            self.bindDefaultInput()
+        }
+        var address = defaultAddress
+        if AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, listener) == noErr {
+            deviceListener = listener
+        }
+        bindDefaultInput()
+    }
+
+    private func bindDefaultInput() {
+        detachDevice()
+        var address = defaultAddress
+        var input = AudioObjectID(0)
+        var size = UInt32(MemoryLayout<AudioObjectID>.size)
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &input) == noErr, input != 0 else { return }
+        var enable = enableAddress
+        var state = stateAddress
+        guard AudioObjectHasProperty(input, &enable), AudioObjectHasProperty(input, &state) else {
+            debugLog("waveform: echo-aware speech detection unsupported; using level fallback")
+            return
+        }
+        var previous: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(input, &enable, 0, nil, &size, &previous) == noErr else { return }
+        device = input
+        if previous == 0 {
+            var value: UInt32 = 1
+            guard AudioObjectSetPropertyData(input, &enable, 0, nil, size, &value) == noErr else {
+                device = 0
+                return
+            }
+            enabledByUs = true
+        }
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            guard let self, self.active, self.device == input else { return }
+            self.readState()
+        }
+        guard AudioObjectAddPropertyListenerBlock(input, &state, .main, listener) == noErr else {
+            detachDevice()
+            return
+        }
+        voiceListener = listener
+        readState()
+        debugLog("waveform: echo-aware local speech detection enabled")
+    }
+
+    private func readState() {
+        var address = stateAddress
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        if AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value) == noErr, value <= 1 {
+            speechDetected = value == 1
+        } else {
+            speechDetected = nil // Failed reads never freeze the microphone flat.
+        }
+    }
+
+    private func detachDevice() {
+        if device != 0 {
+            if let voiceListener {
+                var address = stateAddress
+                AudioObjectRemovePropertyListenerBlock(device, &address, .main, voiceListener)
+            }
+            // Preserve detection that another client had already enabled.
+            if enabledByUs {
+                var address = enableAddress
+                var value: UInt32 = 0
+                AudioObjectSetPropertyData(device, &address, 0, nil, UInt32(MemoryLayout<UInt32>.size), &value)
+            }
+        }
+        voiceListener = nil
+        device = 0
+        enabledByUs = false
+        speechDetected = nil
+    }
+
+    func stop() {
+        active = false
+        if let deviceListener {
+            var address = defaultAddress
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &address, .main, deviceListener)
+        }
+        deviceListener = nil
+        detachDevice()
+    }
+
+    deinit { stop() }
+}
+
 /// Measures the two voices the waveform draws:
 ///
 /// - **orange** — your microphone, so it only moves when you actually talk.
@@ -571,6 +691,7 @@ private func defaultOutputDeviceUID() -> String? {
 /// that side of the waveform flat rather than breaking the activity.
 private final class WaveformMeter {
     private let lock = NSLock()
+    private let speechDetector = LocalSpeechDetector()
     private var micLevel: Float = 0
     private var otherLevel: Float = 0
     private var micRunning = false
@@ -594,6 +715,7 @@ private final class WaveformMeter {
         let micStale: Bool
         let micFrames: Int
         let otherRunning: Bool
+        let localSpeech: Bool?
     }
 
     var snapshot: Snapshot {
@@ -624,7 +746,7 @@ private final class WaveformMeter {
         lock.unlock()
 
         let fresh = micOn && Date().timeIntervalSince(micAt) < micStaleSeconds
-        return Snapshot(mic: fresh ? mic : 0, other: other, micRunning: micOn, micStale: micOn && !fresh, micFrames: micCount, otherRunning: frames > 0)
+        return Snapshot(mic: fresh ? mic : 0, other: other, micRunning: micOn, micStale: micOn && !fresh, micFrames: micCount, otherRunning: frames > 0, localSpeech: speechDetector.speechDetected)
     }
 
     /// True when the engine claims to run but no buffer has arrived recently.
@@ -696,6 +818,7 @@ private final class WaveformMeter {
     }
 
     private func stopMicrophone() {
+        speechDetector.stop()
         if let engine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
@@ -755,6 +878,7 @@ private final class WaveformMeter {
         }
 
         engine = audioEngine
+        speechDetector.start()
         lock.lock()
         micRunning = true
         lock.unlock()
@@ -928,6 +1052,21 @@ private func scaledLevel(_ level: Float, peak: Float) -> Float {
     guard level.isFinite, peak.isFinite, level > silenceFloor else { return 0 }
     let relative = level / max(peak, silenceFloor)
     return min(sqrt(max(relative, 0)) * 1.15, 1)
+}
+
+/// A negative echo-aware speech state gates raw speaker bleed. Nil means the
+/// device has no supported detector, so preserve a level-only fallback.
+private func localMicrophoneLevel(_ level: Float, speechDetected: Bool?) -> Float {
+    guard level.isFinite, level > 0, speechDetected != false else { return 0 }
+    return level
+}
+
+private func scaledMicrophoneLevel(_ level: Float, peak: Float, sensitivity: Double) -> Float {
+    guard sensitivity.isFinite, sensitivity > 0 else { return 0 }
+    let gain = Float(min(max(sensitivity, 0.5), 1.5))
+    // Lower sensitivity raises the gate too, rather than only shrinking bars.
+    guard level > 0.0001 / gain else { return 0 }
+    return min(scaledLevel(level, peak: peak) * gain, 1)
 }
 
 /// Limit transient attacks and recover from loud words in a few seconds.
@@ -1624,6 +1763,7 @@ private final class WhatsAppCallPlugin {
             session.cameraOn.map(String.init) ?? "unknown",
             String(settings.showWaveform),
             String(settings.captureAppAudio),
+            String(settings.microphoneSensitivity),
         ].joined(separator: "|")
 
         guard signature != lastSignature else { return }
@@ -1714,12 +1854,12 @@ private final class WhatsAppCallPlugin {
         } else {
             // Median of the last three readings: speech sustains across
             // buffers, single-buffer device clicks do not.
-            micRecent.append(snapshot.mic)
+            micRecent.append(localMicrophoneLevel(snapshot.mic, speechDetected: snapshot.localSpeech))
             if micRecent.count > 3 { micRecent.removeFirst() }
-            let micSmoothed = micRecent.sorted(by: <)[micRecent.count / 2]
+            let micSmoothed = snapshot.localSpeech == false ? 0 : micRecent.sorted(by: <)[micRecent.count / 2]
             micPeak = updatedPeak(micPeak, micSmoothed)
             otherPeak = updatedPeak(otherPeak, snapshot.other)
-            let you = scaledLevel(micSmoothed, peak: micPeak)
+            let you = scaledMicrophoneLevel(micSmoothed, peak: micPeak, sensitivity: settings.microphoneSensitivity)
             youHistory.append(you)
             themHistory.append(scaledLevel(snapshot.other, peak: otherPeak))
 
@@ -1939,6 +2079,13 @@ private func runSelfTest() -> Int32 {
     check(microphoneCaptureAllowed(.authorized), "reuse granted microphone permission")
     check(!PluginSettings().captureAppAudio, "system audio capture opt-in")
     check(scaledLevel(0, peak: 0.1) == 0 && scaledLevel(0.1, peak: 0.1) == 1, "audio amplitude drives waveform")
+    check(localMicrophoneLevel(0.05, speechDetected: false) == 0, "echo-only input stays flat when no local speech is detected")
+    check(localMicrophoneLevel(0.05, speechDetected: true) == 0.05, "local speech remains visible including double talk")
+    check(localMicrophoneLevel(0.05, speechDetected: nil) == 0.05, "unsupported detector preserves microphone fallback")
+    check(localMicrophoneLevel(.nan, speechDetected: true) == 0, "invalid microphone input stays flat")
+    check(scaledMicrophoneLevel(0.01, peak: 0.1, sensitivity: 0.9) < scaledLevel(0.01, peak: 0.1), "default microphone is slightly less sensitive")
+    check(scaledMicrophoneLevel(0.00011, peak: 0.001, sensitivity: 0.5) == 0, "lower sensitivity requires louder input")
+    check(scaledMicrophoneLevel(0.01, peak: 0.1, sensitivity: 1.5) > scaledMicrophoneLevel(0.01, peak: 0.1, sensitivity: 0.5), "sensitivity slider controls only microphone scaling")
     let midBar = scaledLevel(0.05, peak: 0.1)
     check(midBar > 0.8, "normal speech has a strong bar")
     check(scaledLevel(0.0005, peak: 0.002) > 0.55, "quiet low-gain speech stays visible")

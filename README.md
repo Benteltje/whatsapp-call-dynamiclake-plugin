@@ -31,7 +31,7 @@ Outputs:
 - `build/WhatsAppCall.dynamiclakeplugin/` — installable package with universal executable
 - `WhatsAppCall.dynamiclakeplugin/` — latest complete installable package in the repository root
 - `WhatsAppCall.dynamiclakeplugin.zip` and `.sha256` — stable root download refreshed by every build
-- `dist/WhatsAppCall-1.2.9.dynamiclakeplugin.zip` — versioned release archive
+- `dist/WhatsAppCall-1.2.10.dynamiclakeplugin.zip` — versioned release archive
 - Matching `.sha256` checksum
 
 The root package, stable ZIP and checksum are committed so GitHub users can download without building. Intermediate `build/` and `dist/` output remains ignored. The package contains only runtime files and documentation. Older release archives are preserved when rebuilding.
@@ -53,6 +53,8 @@ Desktop detection needs Accessibility permission for the plugin's host in System
 
 Real audio levels require the applicable macOS microphone/system-audio authorization. Samples become loudness values in memory; nothing is recorded or sent to a remote service. Orange is you: it measures the default microphone, which may differ from WhatsApp's selected input. Green is the other participant: it measures the WhatsApp app output. By default only an already-authorized microphone is opened: no microphone permission is requested, and system-audio capture is off. The optional Other Participant Audio setting enables app output capture and may request system-audio permission. Preview sessions never access real audio and use explicitly simulated levels.
 
+The orange waveform uses CoreAudio’s echo-aware local speech detection when the current default input device supports it. When no local speech is detected, orange stays flat even if the raw microphone hears loudspeaker playback. Your own speech can still show while the other participant speaks. This gates the display only; it does not change WhatsApp’s microphone stream or output volume. Device changes reattach the detector; unsupported devices or failed detector setup/read fall back to microphone levels. Speaker isolation is device-dependent and is not guaranteed on every audio route. App-output capture stays optional and is not required by this detector.
+
 ## Settings
 
 | Setting | Default | Behavior |
@@ -62,6 +64,7 @@ Real audio levels require the applicable macOS microphone/system-audio authoriza
 | Diagnostic Activity | off | Synthetic preview without a call or audio capture |
 | Live Waveform | on | Waveform on the right: your levels, orange, using existing permission |
 | Other Participant Audio | off | Optional app output levels; may need system-audio permission |
+| Microphone Sensitivity | 0.9 | Orange only, 0.5–1.5: lower requires louder speech; higher responds more strongly |
 
 ## Efficiency and reliability
 

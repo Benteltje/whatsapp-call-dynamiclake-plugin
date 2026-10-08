@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.2.10
+
+- Gate the orange waveform with CoreAudio’s echo-aware local voice-activity state on supported input devices, reducing speaker playback being shown as your voice.
+- Keep green app-output metering independent and allow local speech during simultaneous conversation; leave WhatsApp audio routing and volume unchanged.
+- Add a microphone-only sensitivity slider (0.5–1.5), defaulting to a slightly less sensitive 0.9.
+- Attach speech-state and default-input listeners only while the microphone meter is open; detach on mute, hiding, restart or call end. Unsupported devices retain level-only metering.
+- Add offline checks for echo gating, local speech, unsupported-device fallback, sensitivity and live settings reload.
+
+
 ## 1.2.9
 
 - Credit Rafael Reverberi alongside Benteltje in the manifest, source and package documentation.

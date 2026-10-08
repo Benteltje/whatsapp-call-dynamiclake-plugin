@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "identifier": "com.dynamiclake.plugins.whatsapp-call",
   "name": "WhatsApp Call",
-  "version": "1.2.9",
+  "version": "1.2.10",
   "developerName": "Benteltje & Rafael Reverberi",
   "description": "Compact WhatsApp call activity: tilted green phone symbol on the left, live orange input/green output waveform on the right, and microphone, End call and camera controls.",
   "executable": "whatsapp-call-monitor",
@@ -58,6 +58,18 @@
       "default": false,
       "systemImage": "speaker.wave.2.fill",
       "tint": "green"
+    },
+    {
+      "id": "microphoneSensitivity",
+      "title": "Microphone Sensitivity",
+      "description": "Orange bars only: lower values require louder speech; higher values respond more strongly. Echo-aware local speech detection is used when the input device supports it.",
+      "type": "slider",
+      "default": 0.9,
+      "min": 0.5,
+      "max": 1.5,
+      "step": 0.05,
+      "systemImage": "mic.fill",
+      "tint": "orange"
     }
   ]
 }
