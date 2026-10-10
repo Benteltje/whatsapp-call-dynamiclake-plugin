@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "identifier": "com.dynamiclake.plugins.whatsapp-call",
   "name": "WhatsApp Call",
-  "version": "1.2.10",
+  "version": "1.2.11",
   "developerName": "Benteltje & Rafael Reverberi",
   "description": "Compact WhatsApp call activity: tilted green phone symbol on the left, live orange input/green output waveform on the right, and microphone, End call and camera controls.",
   "executable": "whatsapp-call-monitor",
@@ -55,7 +55,7 @@
       "title": "Other Participant Audio",
       "description": "Capture the call app audio as well. Optional: macOS may request system audio recording permission.",
       "type": "switch",
-      "default": false,
+      "default": true,
       "systemImage": "speaker.wave.2.fill",
       "tint": "green"
     },
