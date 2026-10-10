@@ -55,7 +55,7 @@
       "title": "Other Participant Audio",
       "description": "Capture the call app audio as well. Optional: macOS may request system audio recording permission.",
       "type": "switch",
-      "default": false,
+      "default": true,
       "systemImage": "speaker.wave.2.fill",
       "tint": "green"
     },
