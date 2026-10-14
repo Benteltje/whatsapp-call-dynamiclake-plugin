@@ -30,6 +30,17 @@ private let waveformHeight = 28
 /// No mic buffer for this long means the engine was interrupted (another app
 /// took the input) rather than the room going quiet.
 private let micStaleSeconds: TimeInterval = 0.5
+/// A freshly started engine gets this long before silence counts as a stall.
+/// Without it the meter is "stalled" the moment it starts, because the previous
+/// engine's last buffer timestamp is older than `micStaleSeconds`.
+private let micStartGraceSeconds: TimeInterval = 2
+/// Stall restarts back off from three seconds, doubling per attempt up to this
+/// cap, so an input device that never delivers a buffer cannot restart the
+/// engine every few seconds for the whole call.
+private let micStallRetryMaximum: TimeInterval = 60
+/// The restart budget only clears once the meter has been healthy this long,
+/// so an input that dies every few seconds still backs off instead of cycling.
+private let micStallHealthySeconds: TimeInterval = 30
 
 /// The widest compact geometry: a 351 x 33 pt panel with 77 pt side slots, which
 /// provides room for the phone icon and the waveform together.
@@ -706,6 +717,11 @@ private final class WaveformMeter {
     private var micLastAttempt = Date.distantPast
     private var micLastBufferAt = Date.distantPast
     private var micLastRestartAt = Date.distantPast
+    /// When the current engine started, and how many stall restarts it took to
+    /// get a meter that still has not delivered a healthy stretch of buffers.
+    private var micStartedAt = Date.distantPast
+    private var micStallRestarts = 0
+    private var micNextStallRetryAt = Date.distantPast
     private var tapLastAttempt = Date.distantPast
 
     struct Snapshot {
@@ -750,9 +766,14 @@ private final class WaveformMeter {
     }
 
     /// True when the engine claims to run but no buffer has arrived recently.
+    /// The grace period from `micStartedAt` keeps engine spin-up from counting
+    /// as a stall: right after a restart the previous engine's buffer timestamp
+    /// is still old, and treating that as stalled restarted the meter forever.
     private var micInputStalled: Bool {
         lock.lock()
-        let stalled = engine != nil && Date().timeIntervalSince(micLastBufferAt) >= micStaleSeconds
+        let stalled = engine != nil
+            && Date().timeIntervalSince(micStartedAt) >= micStartGraceSeconds
+            && Date().timeIntervalSince(micLastBufferAt) >= micStaleSeconds
         lock.unlock()
         return stalled
     }
@@ -773,14 +794,34 @@ private final class WaveformMeter {
                 lock.lock()
                 if engine == nil { micLastAttempt = Date().addingTimeInterval(2) }
                 lock.unlock()
-            } else if micOpen, micInputStalled, Date().timeIntervalSince(micLastRestartAt) >= 3 {
+            } else if micOpen, !micInputStalled {
+                // Only a sustained healthy stretch clears the restart budget:
+                // one buffer between two stalls must not earn a fast restart.
+                var recoveredAfter = 0
+                lock.lock()
+                if micStallRestarts > 0, Date().timeIntervalSince(micLastRestartAt) >= micStallHealthySeconds {
+                    recoveredAfter = micStallRestarts
+                    micStallRestarts = 0
+                    micNextStallRetryAt = Date.distantPast
+                }
+                lock.unlock()
+                if recoveredAfter > 0 {
+                    debugLog("waveform: microphone input healthy again after \(recoveredAfter) stalled restart(s)")
+                }
+            } else if micOpen, Date() >= micNextStallRetryAt {
                 // The engine object is alive but no buffers arrive: another app
                 // took the input, or the device changed underneath us. Restart
-                // it instead of freezing on the last value forever.
-                debugLog("waveform: input stalled; restarting microphone")
+                // it instead of freezing on the last value forever — with
+                // doubling backoff so a permanently dead input cannot keep
+                // churning the engine every few seconds for the whole call.
                 lock.lock()
+                micStallRestarts += 1
+                let attempt = micStallRestarts
+                let delay = micStallRetryDelay(attempt: attempt)
                 micLastRestartAt = Date()
+                micNextStallRetryAt = Date().addingTimeInterval(delay)
                 lock.unlock()
+                debugLog("waveform: input stalled; restarting microphone (attempt \(attempt), \(Int(delay))s until the next restart if it stays silent)")
                 stopMicrophone()
                 startMicrophone()
                 lock.lock()
@@ -791,6 +832,7 @@ private final class WaveformMeter {
             // Muted, or state unknown: the orange side is drawn flat anyway, so
             // keeping an input stream open only costs memory for nothing.
             stopMicrophone()
+            resetStallBudget()
         }
 
         if !tapWanted {
@@ -804,6 +846,16 @@ private final class WaveformMeter {
         }
     }
 
+    /// A deliberate close (mute, hidden activity, call end) starts the next
+    /// open with a full restart budget instead of a half-spent one.
+    private func resetStallBudget() {
+        lock.lock()
+        micStallRestarts = 0
+        micNextStallRetryAt = Date.distantPast
+        micLastRestartAt = Date.distantPast
+        lock.unlock()
+    }
+
     func stop() {
         stopMicrophone()
         stopTap()
@@ -815,6 +867,7 @@ private final class WaveformMeter {
         micRunning = false
         otherFrames = -1
         lock.unlock()
+        resetStallBudget()
     }
 
     private func stopMicrophone() {
@@ -881,6 +934,10 @@ private final class WaveformMeter {
         speechDetector.start()
         lock.lock()
         micRunning = true
+        // Fresh engine, fresh clock: the stall window starts here instead of
+        // inheriting the previous engine's last buffer (or launch) timestamp.
+        micStartedAt = Date()
+        micLastBufferAt = Date()
         lock.unlock()
         debugLog("waveform: microphone meter running device=\(inputDeviceName())")
     }
@@ -1075,6 +1132,17 @@ private func updatedPeak(_ peak: Float, _ level: Float) -> Float {
     if peak < silenceFloor { return level }
     if level > peak { return min(level, peak * 4) }
     return max(silenceFloor, peak * 0.96)
+}
+
+/// Delay before the microphone may be restarted after a stalled input: three
+/// seconds for the first attempt, doubling per attempt up to
+/// `micStallRetryMaximum`. The budget only clears after a healthy stretch, so
+/// an input device that never delivers buffers settles at the cap instead of
+/// restarting the engine every few seconds for the rest of the call.
+private func micStallRetryDelay(attempt: Int) -> TimeInterval {
+    guard attempt > 1 else { return 3 }
+    let doublings = Double(min(attempt - 1, 8))
+    return min(3 * pow(2, doublings), micStallRetryMaximum)
 }
 
 private func renderWaveformPNG(you: [Float], them: [Float], youMuted: Bool) -> Data? {
@@ -2092,6 +2160,10 @@ private func runSelfTest() -> Int32 {
     check(scaledLevel(0.00005, peak: 0.002) == 0, "silence stays flat")
     check(scaledLevel(0.002, peak: 0.1) > 0.15, "quiet speech remains visible after a loud word")
     check(abs(updatedPeak(0.01, 0.2) - 0.04) < 0.00001 && updatedPeak(0.2, 0.01) < 0.2, "peak attack and slow release")
+    check(micStallRetryDelay(attempt: 1) == 3, "first stall restart stays quick")
+    check(micStallRetryDelay(attempt: 2) > micStallRetryDelay(attempt: 1), "stall restarts back off")
+    check(micStallRetryDelay(attempt: 4) <= micStallRetryMaximum, "stall restart backoff is capped")
+    check(micStallRetryDelay(attempt: 1000) == micStallRetryMaximum, "a dead input settles at the retry cap")
     check(doubleValue("nan", default: 1, minimum: 0.5, maximum: 5) == 1, "non-finite setting")
     check(doubleValue(99, default: 1, minimum: 0.5, maximum: 5) == 5, "setting clamp")
     let settings = PluginSettings()

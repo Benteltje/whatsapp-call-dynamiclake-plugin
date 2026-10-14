@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.12
+
+- Fix the microphone meter restarting itself in a loop during a call: a freshly started engine inherited the previous engine's last-buffer timestamp, so it looked stalled the moment it opened and was restarted every three seconds even while the input was fine. The stall window now starts when the engine starts.
+- Stall restarts now back off (3 s, doubling per attempt up to 60 s) and only clear after 30 seconds of healthy input, so an input device that never delivers buffers settles at the retry cap instead of churning the engine for the rest of the call. Muting, hiding or ending the call restores the full restart budget.
+- Log the stall restart attempt and the delay until the next one, and log when the input becomes healthy again.
+
 ## 1.2.10
 
 - Gate the orange waveform with CoreAudio’s echo-aware local voice-activity state on supported input devices, reducing speaker playback being shown as your voice.
